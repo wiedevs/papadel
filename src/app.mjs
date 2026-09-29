@@ -36,11 +36,15 @@ import {
   normalizeRole,
   verifyPasscode,
 } from './authz.mjs';
+import { SUPABASE_URL, SUPABASE_ANON_KEY } from './cloud-config.mjs';
+import { createRemote } from './remote.mjs';
+import { createSyncQueue, splitSessions } from './cloud.mjs';
 
 const LS_CURRENT = 'papadel.current.v1';
 const LS_HISTORY = 'papadel.history.v1';
 const LS_THEME = 'papadel.theme.v1';
 const LS_ROLE = 'papadel.role.v1';
+const LS_AUTH = 'papadel.auth.v1';
 
 const $app = document.getElementById('app');
 const $nav = document.getElementById('nav');
@@ -79,6 +83,133 @@ const draft = {
 const formDrafts = new Map();
 
 const RECENT_SESSION_COUNT = 3;
+
+// --- Cloud board ----------------------------------------------------------
+// The server holds the shared board; localStorage stays a cache so the page
+// still opens with no network at all. A viewer's browser cannot save anything:
+// RLS only accepts writes carrying a signed-in token, so "admin" in cloud mode
+// means "signed in", not "the local role says so".
+const remote = createRemote();
+const cloudAvailable =
+  /^https:\/\/[a-z0-9]+\.supabase\.co$/.test(SUPABASE_URL) && Boolean(SUPABASE_ANON_KEY);
+
+let cloudPhase = cloudAvailable ? 'connecting' : 'local';
+let cloudError = null;
+
+const queue = createSyncQueue({
+  upsert: (doc) => remote.upsert(doc),
+  remove: (id) => remote.remove(id),
+  onState: (state, count) => {
+    if (state === 'error') {
+      cloudPhase = 'error';
+    } else if (state === 'synced') {
+      cloudPhase = 'live';
+      cloudError = null;
+    } else if (state === 'pending' || state === 'sending') {
+      cloudPhase = 'pending';
+      if (count) cloudError = null;
+    }
+    renderCloudPill();
+  },
+});
+
+function storeAuthSession() {
+  try {
+    const s = remote.storedSession;
+    if (s) localStorage.setItem(LS_AUTH, JSON.stringify(s));
+    else localStorage.removeItem(LS_AUTH);
+  } catch {
+    /* storage unavailable — the login still works for this page */
+  }
+}
+
+// In cloud mode the role is a fact about the token, not a preference: without a
+// signed-in session the server will refuse every write, so offering "admin" to a
+// visitor who cannot use it would only be theatre.
+function adoptCloudRole() {
+  setRole(remote.signedIn ? ROLES[0] : ROLES[1]);
+}
+
+async function bootCloud() {
+  if (!cloudAvailable) return;
+  try {
+    let stored = null;
+    try {
+      stored = JSON.parse(localStorage.getItem(LS_AUTH));
+    } catch {
+      stored = null;
+    }
+    await remote.restore(stored);
+    storeAuthSession();
+    adoptCloudRole();
+    const docs = await remote.fetchSessions();
+    const { live, finished } = splitSessions(docs);
+    if (live || finished.length) {
+      current = live;
+      history = finished;
+      saveSessions(current, history);
+      if (current && view !== 'setup') view = 'live';
+    } else if (remote.signedIn && (current || history.length)) {
+      // Empty board on the server, a board in this browser: this is the first
+      // sync, so hand the local data up instead of silently wiping it.
+      for (const s of [...(current ? [current] : []), ...history]) queue.put(s);
+    }
+    cloudPhase = 'live';
+    cloudError = null;
+  } catch (err) {
+    // Unreachable server is not an error the visitor can fix, so the local
+    // board they already have stays on screen and the pill says what happened.
+    cloudPhase = 'offline';
+    cloudError = err?.message ?? String(err);
+  }
+  closeEditors();
+  applyChrome();
+  render();
+  renderCloudPill();
+}
+
+async function cloudSignIn(email, password) {
+  const s = await remote.signIn(email, password);
+  if (!s) throw new Error('no session');
+  storeAuthSession();
+  adoptCloudRole();
+  closeEditors();
+  clearToast();
+  applyChrome();
+  render();
+  renderCloudPill();
+  flashMsg(t('toast.signInOk'), 'ok');
+  void bootCloud();
+}
+
+async function cloudSignOut() {
+  await queue.flush();
+  await remote.signOut();
+  storeAuthSession();
+  adoptCloudRole();
+  closeEditors();
+  applyChrome();
+  render();
+  renderCloudPill();
+  flashMsg(t('toast.signOut'), 'ok');
+}
+
+function cloudLabel() {
+  if (!cloudAvailable) return t('cloud.local');
+  if (queue.size || cloudPhase === 'pending') return t('cloud.pending', { count: queue.size });
+  if (cloudPhase === 'connecting') return t('cloud.connecting');
+  if (cloudPhase === 'error') return t('cloud.error');
+  if (cloudPhase === 'offline') return t('cloud.offline');
+  return remote.signedIn ? t('cloud.synced') : t('cloud.readonly');
+}
+
+function renderCloudPill() {
+  const el = document.getElementById('cloud-pill');
+  if (!el) return;
+  el.textContent = cloudLabel();
+  el.className = `cloud-pill ${cloudPhase === 'error' || cloudPhase === 'offline' ? 'warn' : ''}`.trim();
+  el.title = cloudError ? `${cloudLabel()} — ${cloudError}` : cloudLabel();
+}
 
 function todayStr() {
   const d = new Date();
@@ -154,13 +285,16 @@ function removeKey(key) {
 // The two places saved session data leaves the app. Every user-facing write
 // routes through these, so a viewer is stopped here even if a call site forgets
 // to check. The load-time normalisation write-back deliberately bypasses this.
+// `saveCurrent` also feeds the cloud queue: the live session is always the one
+// that just changed, so it needs no call-site bookkeeping.
 function saveCurrent() {
-  if (!can(role, ACTIONS.SESSION_UPDATE)) return;
+  if (!canWrite(ACTIONS.SESSION_UPDATE)) return;
   writeJSON(LS_CURRENT, current);
+  if (cloudAvailable && current) queue.put(current);
 }
 
 function saveHistory() {
-  if (!can(role, ACTIONS.SESSION_UPDATE)) return;
+  if (!canWrite(ACTIONS.SESSION_UPDATE)) return;
   writeJSON(LS_HISTORY, history);
 }
 
@@ -239,8 +373,12 @@ function applyChrome() {
 // `guardWrite` is what the handlers call before touching the engine, so a
 // control that was on screen when the role changed still cannot write. A null
 // action means the affordance touches no saved data.
+//
+// With a shared board the local role alone is not enough: without a signed-in
+// token every write comes back as a rejection, so the controls stay hidden.
 function canWrite(action) {
-  return can(role, action);
+  if (!can(role, action)) return false;
+  return !cloudAvailable || remote.signedIn;
 }
 
 function guardWrite(action) {
@@ -287,12 +425,40 @@ const LOCK_ICON =
 function renderRoleToggle() {
   if (!$roleToggle) return;
   $roleToggle.setAttribute?.('aria-label', t('role.toggleLabel'));
+  if (cloudAvailable) {
+    // Signed in: admin is a fact about the token, so the only useful control is
+    // leaving it. Not signed in: the way in is a login, not a role switch.
+    $roleToggle.innerHTML = remote.signedIn
+      ? `<button class="lang-btn active" data-action="sign-out" title="${t('role.signOutTitle')}">${t('role.signOut')}</button>`
+      : `<button class="lang-btn" data-action="show-unlock" title="${t('role.signIn.title')}">${LOCK_ICON}${t('role.signIn')}</button>`;
+    return;
+  }
   // Admin is not a button a viewer can press — it has to be unlocked first.
   const unlock = `<button class="lang-btn" data-action="show-unlock" title="${t('role.unlock.title')}">${LOCK_ICON}${t('role.unlock')}</button>`;
   $roleToggle.innerHTML = role === 'admin' ? ROLES.map(roleButton).join('') : unlock + roleButton('viewer');
 }
 
+// Two different doors, and only one of them is a real one. With a shared board
+// the credentials go to Supabase Auth, so the server decides who may write; the
+// passcode survives only as the local-mode affordance it always claimed to be.
 function unlockDialogHtml() {
+  if (cloudAvailable) {
+    return `<form class="unlock-body" novalidate>
+      <h2>${t('role.signIn.title')}</h2>
+      <label class="field">${t('role.signInEmail')}
+        <input id="f-email" type="email" autocomplete="username" spellcheck="false" required>
+      </label>
+      <label class="field">${t('role.signInPassword')}
+        <input id="f-secret" type="password" autocomplete="current-password" required>
+      </label>
+      <p class="unlock-error" id="unlock-error" hidden></p>
+      <div class="row end">
+        <button class="btn" type="button" data-action="cancel-unlock">${t('role.unlockCancel')}</button>
+        <button class="btn primary" type="submit">${t('role.signInSubmit')}</button>
+      </div>
+      <p class="muted unlock-hint">${t('role.signInHint')}</p>
+    </form>`;
+  }
   return `<form class="unlock-body" novalidate>
     <h2>${t('role.unlock.title')}</h2>
     <label class="field">${t('role.unlockLabel')}
@@ -311,16 +477,16 @@ function openUnlockDialog() {
   if (!$unlockDialog) return;
   $unlockDialog.innerHTML = unlockDialogHtml();
   $unlockDialog.showModal();
-  document.getElementById('f-passcode')?.focus();
+  document.getElementById(cloudAvailable ? 'f-email' : 'f-passcode')?.focus();
 }
 
-function showUnlockError() {
+function showUnlockError(message) {
   const box = document.getElementById('unlock-error');
   if (box) {
-    box.textContent = t('toast.passcodeWrong');
+    box.textContent = message || t('toast.passcodeWrong');
     box.hidden = false;
   }
-  const input = document.getElementById('f-passcode');
+  const input = document.getElementById(cloudAvailable ? 'f-secret' : 'f-passcode');
   if (input) {
     input.setAttribute('aria-invalid', 'true');
     input.select();
@@ -380,6 +546,9 @@ function findSession(id) {
 function persist(session) {
   if (session.status === 'live') saveCurrent();
   else saveHistory();
+  // The server keeps one row per session, so the session that just changed is
+  // the only thing worth sending.
+  if (cloudAvailable && canWrite(ACTIONS.SESSION_UPDATE)) queue.put(session);
 }
 
 function sessionTitle(session) {
@@ -521,6 +690,7 @@ function render() {
   renderLangToggle();
   renderRoleToggle();
   renderThemeToggle();
+  renderCloudPill();
   if (view === 'setup') {
     seedDraftFromRecent();
     $app.innerHTML = setupView();
@@ -1053,6 +1223,8 @@ function endSessionFlow() {
   finishSession(current);
   history.push(current);
   saveHistory();
+  // Same row, new status: the doc is rewritten rather than duplicated.
+  if (cloudAvailable && canWrite(ACTIONS.SESSION_UPDATE)) queue.put(current);
   current = null;
   removeKey(LS_CURRENT);
   closeEditors();
@@ -1088,9 +1260,13 @@ $themeToggle?.addEventListener('click', () => {
   renderThemeToggle();
 });
 
-$roleToggle?.addEventListener('click', (e) => {
+$roleToggle?.addEventListener('click', async (e) => {
   if (e.target.closest('[data-action="show-unlock"]')) {
     openUnlockDialog();
+    return;
+  }
+  if (e.target.closest('[data-action="sign-out"]')) {
+    await cloudSignOut();
     return;
   }
   const btn = e.target.closest('[data-role]');
@@ -1104,8 +1280,22 @@ $roleToggle?.addEventListener('click', (e) => {
   render();
 });
 
-$unlockDialog?.addEventListener('submit', (e) => {
+$unlockDialog?.addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (cloudAvailable) {
+    const email = document.getElementById('f-email')?.value ?? '';
+    const secret = document.getElementById('f-secret')?.value ?? '';
+    const submit = $unlockDialog.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      await cloudSignIn(email, secret);
+      $unlockDialog.close();
+    } catch (err) {
+      if (submit) submit.disabled = false;
+      showUnlockError(err?.status === 400 ? t('toast.signInFail') : t('toast.signInUnavailable'));
+    }
+    return;
+  }
   if (!verifyPasscode(document.getElementById('f-passcode')?.value)) {
     showUnlockError();
     return;
@@ -1242,6 +1432,7 @@ $app.addEventListener('click', (e) => {
     if (target && confirm(t('confirm.deleteSession', { label: sessionLabel(target) }))) {
       history = history.filter((s) => s.id !== d.sid);
       saveHistory();
+      if (cloudAvailable && canWrite(ACTIONS.SESSION_DELETE)) queue.drop(d.sid);
       lbFilter = 'all';
       closeEditors();
       flashMsg(t('toast.sessionDeleted'), 'ok');
@@ -1249,6 +1440,9 @@ $app.addEventListener('click', (e) => {
     render();
   } else if (d.action === 'discard-live') {
     if (current && confirm(t('confirm.discardLive'))) {
+      // A discarded live session was never finished, so it leaves the server
+      // too rather than lingering as the board nobody played.
+      if (cloudAvailable && canWrite(ACTIONS.SESSION_DELETE)) queue.drop(current.id);
       current = null;
       removeKey(LS_CURRENT);
       lbFilter = 'all';
@@ -1398,9 +1592,13 @@ $toast.addEventListener('click', (e) => {
   if (e.target.closest('[data-action="close-toast"]')) clearToast();
 });
 
-document.getElementById('clear-all').addEventListener('click', () => {
+document.getElementById('clear-all').addEventListener('click', async () => {
   if (!guardWrite(ACTIONS.DATA_WIPE)) return;
-  if (!confirm(t('confirm.clearAll'))) return;
+  // On the shared board this deletes everyone's sessions, not just this
+  // browser's, so the warning has to be the honest one.
+  if (!confirm(cloudAvailable ? t('confirm.clearAllCloud') : t('confirm.clearAll'))) return;
+  const wiped = [...history, ...(current ? [current] : [])].map((s) => s.id);
+  queue.clear();
   removeKey(LS_CURRENT);
   removeKey(LS_HISTORY);
   current = null;
@@ -1412,12 +1610,19 @@ document.getElementById('clear-all').addEventListener('click', () => {
   lbFilter = 'all';
   view = 'setup';
   render();
+  if (!cloudAvailable) return;
+  for (const id of wiped) remote.remove(id).catch(() => null);
+  cloudPhase = 'live';
+  renderCloudPill();
 });
 
 // Hook for automated smoke tests; no UI impact.
 window.$papadel = {
   get state() {
     return { current, history, view, role };
+  },
+  get cloud() {
+    return { available: cloudAvailable, phase: cloudPhase, signedIn: remote.signedIn, queued: queue.size, error: cloudError };
   },
   get startup() {
     return { dropped: saved.dropped };
@@ -1438,3 +1643,10 @@ window.$papadel = {
 applyChrome();
 render();
 if (saved.dropped) flashMsg(t('toast.dataRepaired', { count: saved.dropped }));
+
+// A tab closed on court must not swallow the last debounce window.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') void queue.flush();
+});
+
+void bootCloud();

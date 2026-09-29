@@ -1,3 +1,9 @@
 node_modules/
 *.log
 .DS_Store
+
+# kredensial Supabase (token, URL proyek, anon key) — jangan pernah di commit
+.env
+.env.*
+!.env.example
+supabase/.temp/

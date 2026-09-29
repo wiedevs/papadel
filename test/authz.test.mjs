@@ -96,6 +96,8 @@ test('every action rendered in the UI is either a mapped write or a declared rea
     'close-toast',
     'show-unlock',
     'toggle-csv',
+    // Signing out changes who the browser may act as; it never touches a row.
+    'sign-out',
   ]);
   const rendered = new Set([...appSource.matchAll(/data-action="([a-z-]+)"/g)].map((m) => m[1]));
   assert.ok(rendered.size >= 22, `expected the UI action inventory, got ${rendered.size}`);
