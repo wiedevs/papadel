@@ -36,15 +36,24 @@ import {
   normalizeRole,
   verifyPasscode,
 } from './authz.mjs';
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from './cloud-config.mjs';
+import { SUPABASE_URL, SUPABASE_ANON_KEY, GOOGLE_LOGIN } from './cloud-config.mjs';
 import { createRemote } from './remote.mjs';
-import { createSyncQueue, splitSessions } from './cloud.mjs';
+import {
+  createSyncQueue,
+  splitSessions,
+  createPkcePair,
+  buildAuthorizeUrl,
+  parseAuthRedirect,
+  cleanAuthUrl,
+} from './cloud.mjs';
 
 const LS_CURRENT = 'papadel.current.v1';
 const LS_HISTORY = 'papadel.history.v1';
 const LS_THEME = 'papadel.theme.v1';
 const LS_ROLE = 'papadel.role.v1';
 const LS_AUTH = 'papadel.auth.v1';
+// Only this tab may finish the PKCE exchange, so the verifier never leaves it.
+const PKCE_KEY = 'papadel.pkce.v1';
 
 const $app = document.getElementById('app');
 const $nav = document.getElementById('nav');
@@ -123,24 +132,65 @@ function storeAuthSession() {
   }
 }
 
-// In cloud mode the role is a fact about the token, not a preference: without a
-// signed-in session the server will refuse every write, so offering "admin" to a
-// visitor who cannot use it would only be theatre.
+// In cloud mode the role is a fact about the token, not a preference. Two
+// things have to hold before the server will accept a write: a signed-in JWT,
+// and that email listed in public.admins (0002). A Google account that is not
+// on the list signs in as a reader, so offering it admin buttons would be
+// theatre — and a denied request, not a UI.
+let cloudAdmin = false;
+
+async function refreshCloudAdmin() {
+  cloudAdmin = cloudAvailable ? remote.signedIn && (await remote.isAdmin()) : true;
+  return cloudAdmin;
+}
+
 function adoptCloudRole() {
-  setRole(remote.signedIn ? ROLES[0] : ROLES[1]);
+  setRole(remote.signedIn && cloudAdmin ? ROLES[0] : ROLES[1]);
+}
+
+// Supabase returns from /authorize and from recovery links on this same URL.
+// Consuming it once at boot is what turns the redirect into a session.
+async function handleAuthRedirect() {
+  const found = parseAuthRedirect({ search: location.search, hash: location.hash });
+  if (!found) return null;
+  const verifier = sessionStorage.getItem(PKCE_KEY);
+  sessionStorage.removeItem(PKCE_KEY);
+  // `history` is the session list in this module, so the browser API has to be
+  // reached through window — the bare name resolves to an array and throws.
+  window.history.replaceState(window.history.state, '', cleanAuthUrl(location.href));
+  if (found.kind === 'error') {
+    cloudPhase = 'live';
+    cloudError = found.message;
+    return { error: found.message };
+  }
+  let session = null;
+  if (found.kind === 'code') {
+    session = await remote.exchangeAuthCode(found.code, verifier);
+  } else if (found.kind === 'token') {
+    session = remote.adoptTokenPayload(found.session);
+  }
+  storeAuthSession();
+  await refreshCloudAdmin();
+  adoptCloudRole();
+  if (session) flashMsg(found.recovery ? t('toast.recovered') : t('toast.signInOk'), 'ok');
+  return { recovered: found.recovery, signedIn: Boolean(session) };
 }
 
 async function bootCloud() {
   if (!cloudAvailable) return;
   try {
-    let stored = null;
-    try {
-      stored = JSON.parse(localStorage.getItem(LS_AUTH));
-    } catch {
-      stored = null;
+    await handleAuthRedirect();
+    if (!remote.signedIn) {
+      let stored = null;
+      try {
+        stored = JSON.parse(localStorage.getItem(LS_AUTH));
+      } catch {
+        stored = null;
+      }
+      await remote.restore(stored);
+      storeAuthSession();
     }
-    await remote.restore(stored);
-    storeAuthSession();
+    await refreshCloudAdmin();
     adoptCloudRole();
     const docs = await remote.fetchSessions();
     const { live, finished } = splitSessions(docs);
@@ -149,7 +199,7 @@ async function bootCloud() {
       history = finished;
       saveSessions(current, history);
       if (current && view !== 'setup') view = 'live';
-    } else if (remote.signedIn && (current || history.length)) {
+    } else if (remote.signedIn && cloudAdmin && (current || history.length)) {
       // Empty board on the server, a board in this browser: this is the first
       // sync, so hand the local data up instead of silently wiping it.
       for (const s of [...(current ? [current] : []), ...history]) queue.put(s);
@@ -161,6 +211,11 @@ async function bootCloud() {
     // board they already have stays on screen and the pill says what happened.
     cloudPhase = 'offline';
     cloudError = err?.message ?? String(err);
+    adoptCloudRole();
+    // A boot that never finished cannot claim the token that would be needed to
+    // honour the role left over in localStorage.
+    cloudAdmin = false;
+    adoptCloudRole();
   }
   closeEditors();
   applyChrome();
@@ -172,13 +227,14 @@ async function cloudSignIn(email, password) {
   const s = await remote.signIn(email, password);
   if (!s) throw new Error('no session');
   storeAuthSession();
+  await refreshCloudAdmin();
   adoptCloudRole();
   closeEditors();
   clearToast();
   applyChrome();
   render();
   renderCloudPill();
-  flashMsg(t('toast.signInOk'), 'ok');
+  flashMsg(cloudAdmin ? t('toast.signInOk') : t('toast.signInReadOnly'), cloudAdmin ? 'ok' : 'warn');
   void bootCloud();
 }
 
@@ -186,6 +242,7 @@ async function cloudSignOut() {
   await queue.flush();
   await remote.signOut();
   storeAuthSession();
+  cloudAdmin = false;
   adoptCloudRole();
   closeEditors();
   applyChrome();
@@ -194,13 +251,43 @@ async function cloudSignOut() {
   flashMsg(t('toast.signOut'), 'ok');
 }
 
+// Supabase only accepts redirect targets on its allow list, and the Pages build
+// lives under /papadel/, so the origin+pathname of this page is the callback.
+function redirectTo() {
+  return `${location.origin}${location.pathname}`;
+}
+
+async function cloudRecover(email) {
+  await remote.recover(email);
+  return t('toast.recoverSent');
+}
+
+// Kicked over to /auth/v1/authorize with a PKCE challenge; the browser leaves
+// this page, so anything unsaved is already in localStorage by now.
+async function startGoogleLogin() {
+  const { verifier, challenge } = await createPkcePair();
+  sessionStorage.setItem(PKCE_KEY, verifier);
+  location.assign(
+    buildAuthorizeUrl({
+      url: SUPABASE_URL,
+      provider: 'google',
+      redirectTo: redirectTo(),
+      challenge,
+    })
+  );
+}
+
 function cloudLabel() {
   if (!cloudAvailable) return t('cloud.local');
   if (queue.size || cloudPhase === 'pending') return t('cloud.pending', { count: queue.size });
   if (cloudPhase === 'connecting') return t('cloud.connecting');
   if (cloudPhase === 'error') return t('cloud.error');
   if (cloudPhase === 'offline') return t('cloud.offline');
-  return remote.signedIn ? t('cloud.synced') : t('cloud.readonly');
+  return remote.signedIn
+    ? cloudAdmin
+      ? t('cloud.synced')
+      : t('cloud.signedReadonly')
+    : t('cloud.readonly');
 }
 
 function renderCloudPill() {
@@ -378,7 +465,7 @@ function applyChrome() {
 // token every write comes back as a rejection, so the controls stay hidden.
 function canWrite(action) {
   if (!can(role, action)) return false;
-  return !cloudAvailable || remote.signedIn;
+  return !cloudAvailable || (remote.signedIn && cloudAdmin);
 }
 
 function guardWrite(action) {
@@ -441,10 +528,19 @@ function renderRoleToggle() {
 // Two different doors, and only one of them is a real one. With a shared board
 // the credentials go to Supabase Auth, so the server decides who may write; the
 // passcode survives only as the local-mode affordance it always claimed to be.
-function unlockDialogHtml() {
-  if (cloudAvailable) {
-    return `<form class="unlock-body" novalidate>
+let unlockMode = 'signin';
+
+const GOOGLE_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 0 0-1.7 19.9v-6.2H8.3a.3.3 0 0 1-.3-.3v-2.5h2V9.4a2.9 2.9 0 0 1 3.2-2.9c.9 0 1.7.1 2.2.3v2.4h-1.2c-.8 0-1.2.5-1.2 1.1v1.8h2.4l-.4 2.5h-2v6.2A10 10 0 0 0 12 2z"/></svg>';
+
+function signinFormHtml() {
+  const google = GOOGLE_LOGIN
+    ? `<button class="btn oauth-btn" type="button" data-action="oauth-google">${GOOGLE_ICON}${t('role.signInGoogle')}</button>
+      <p class="oauth-or muted">${t('role.signInOr')}</p>`
+    : '';
+  return `<form class="unlock-body" novalidate>
       <h2>${t('role.signIn.title')}</h2>
+      ${google}
       <label class="field">${t('role.signInEmail')}
         <input id="f-email" type="email" autocomplete="username" spellcheck="false" required>
       </label>
@@ -456,9 +552,32 @@ function unlockDialogHtml() {
         <button class="btn" type="button" data-action="cancel-unlock">${t('role.unlockCancel')}</button>
         <button class="btn primary" type="submit">${t('role.signInSubmit')}</button>
       </div>
+      <p class="unlock-links">
+        <button class="th-link" type="button" data-action="show-recover">${t('role.forgot')}</button>
+      </p>
       <p class="muted unlock-hint">${t('role.signInHint')}</p>
     </form>`;
-  }
+}
+
+// Deliberately vague on success: GoTrue answers 200 for unknown addresses too,
+// so the app must not confirm that an email has an account.
+function recoverFormHtml() {
+  return `<form class="unlock-body" novalidate>
+      <h2>${t('role.recoverTitle')}</h2>
+      <p class="muted unlock-hint">${t('role.recoverHint')}</p>
+      <label class="field">${t('role.signInEmail')}
+        <input id="f-recover-email" type="email" autocomplete="username" spellcheck="false" required>
+      </label>
+      <p class="unlock-error" id="unlock-error" hidden></p>
+      <div class="row end">
+        <button class="btn" type="button" data-action="back-to-signin">${t('role.recoverBack')}</button>
+        <button class="btn primary" type="submit" data-action="send-recover">${t('role.recoverSubmit')}</button>
+      </div>
+    </form>`;
+}
+
+function unlockDialogHtml() {
+  if (cloudAvailable) return unlockMode === 'recover' ? recoverFormHtml() : signinFormHtml();
   return `<form class="unlock-body" novalidate>
     <h2>${t('role.unlock.title')}</h2>
     <label class="field">${t('role.unlockLabel')}
@@ -473,11 +592,17 @@ function unlockDialogHtml() {
   </form>`;
 }
 
-function openUnlockDialog() {
+function openUnlockDialog(mode = 'signin') {
   if (!$unlockDialog) return;
+  unlockMode = mode;
   $unlockDialog.innerHTML = unlockDialogHtml();
   $unlockDialog.showModal();
-  document.getElementById(cloudAvailable ? 'f-email' : 'f-passcode')?.focus();
+  document.getElementById(dialogFocusId())?.focus();
+}
+
+function dialogFocusId() {
+  if (!cloudAvailable) return 'f-passcode';
+  return unlockMode === 'recover' ? 'f-recover-email' : 'f-email';
 }
 
 function showUnlockError(message) {
@@ -486,7 +611,9 @@ function showUnlockError(message) {
     box.textContent = message || t('toast.passcodeWrong');
     box.hidden = false;
   }
-  const input = document.getElementById(cloudAvailable ? 'f-secret' : 'f-passcode');
+  const input = document.getElementById(
+    !cloudAvailable ? 'f-passcode' : unlockMode === 'recover' ? 'f-recover-email' : 'f-secret'
+  );
   if (input) {
     input.setAttribute('aria-invalid', 'true');
     input.select();
@@ -1283,16 +1410,22 @@ $roleToggle?.addEventListener('click', async (e) => {
 $unlockDialog?.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (cloudAvailable) {
-    const email = document.getElementById('f-email')?.value ?? '';
-    const secret = document.getElementById('f-secret')?.value ?? '';
     const submit = $unlockDialog.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      await cloudSignIn(email, secret);
+      if (unlockMode === 'recover') {
+        const message = await cloudRecover(document.getElementById('f-recover-email')?.value ?? '');
+        $unlockDialog.close();
+        unlockMode = 'signin';
+        flashMsg(message, 'ok');
+        return;
+      }
+      await cloudSignIn(document.getElementById('f-email')?.value ?? '', document.getElementById('f-secret')?.value ?? '');
       $unlockDialog.close();
     } catch (err) {
       if (submit) submit.disabled = false;
-      showUnlockError(err?.status === 400 ? t('toast.signInFail') : t('toast.signInUnavailable'));
+      if (unlockMode === 'recover') showUnlockError(t('toast.recoverFail'));
+      else showUnlockError(err?.status === 400 ? t('toast.signInFail') : t('toast.signInUnavailable'));
     }
     return;
   }
@@ -1309,8 +1442,29 @@ $unlockDialog?.addEventListener('submit', async (e) => {
   flashMsg(t('toast.unlocked'), 'ok');
 });
 
-$unlockDialog?.addEventListener('click', (e) => {
-  if (e.target.closest('[data-action="cancel-unlock"]')) $unlockDialog.close();
+$unlockDialog?.addEventListener('click', async (e) => {
+  if (e.target.closest('[data-action="cancel-unlock"]')) {
+    $unlockDialog.close();
+    return;
+  }
+  if (e.target.closest('[data-action="show-recover"]')) {
+    openUnlockDialog('recover');
+    return;
+  }
+  if (e.target.closest('[data-action="back-to-signin"]')) {
+    openUnlockDialog('signin');
+    return;
+  }
+  const google = e.target.closest('[data-action="oauth-google"]');
+  if (google) {
+    google.disabled = true;
+    try {
+      await startGoogleLogin();
+    } catch {
+      google.disabled = false;
+      showUnlockError(t('toast.signInUnavailable'));
+    }
+  }
 });
 
 $app.addEventListener('click', (e) => {

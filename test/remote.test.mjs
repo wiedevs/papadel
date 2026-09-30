@@ -231,3 +231,107 @@ test('signIn: respons tanpa access_token tidak jadi sesi', async () => {
   assert.equal(await remote.signIn('a@b.c', 'pw'), null);
   assert.equal(remote.signedIn, false);
 });
+
+// --- lupa sandi + OAuth ----------------------------------------------------
+
+test('recover: email dikirim apa adanya, tanpa klaim berhasil', async () => {
+  const { calls, remote } = harness({
+    handlers: { '/auth/v1/recover': () => respond(200, { sent_at: '2026-09-30T00:00:00Z' }) },
+  });
+  await remote.recover('  Ayu@Example.com  ');
+  assert.equal(calls[0].path, '/auth/v1/recover');
+  assert.deepEqual(calls[0].body, { email: 'Ayu@Example.com' });
+  assert.equal(remote.signedIn, false, 'minta tautan reset tidak boleh jadi sesi');
+});
+
+test('recover: email kosong ditolak server, bukan oleh klien', async () => {
+  const { calls, remote } = harness({
+    handlers: { '/auth/v1/recover': () => respond(422, { message: 'Unable to validate email address: invalid format' }) },
+  });
+  await assert.rejects(() => remote.recover('bukan-email'), /validate email/);
+  assert.equal(calls.length, 1);
+});
+
+test('exchangeAuthCode: menukar code + verifier jadi sesi', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token?grant_type=pkce': () => respond(200, { ...TOKEN, email: null, user: { email: 'ayu@gmail.com' } }),
+    },
+  });
+  const s = await remote.exchangeAuthCode('CODE123', 'verifier-dari-tab-ini');
+  assert.equal(calls[0].path, '/auth/v1/token?grant_type=pkce');
+  assert.deepEqual(calls[0].body, { auth_code: 'CODE123', code_verifier: 'verifier-dari-tab-ini' });
+  assert.equal(s.email, 'ayu@gmail.com');
+  assert.equal(remote.signedIn, true);
+  assert.equal(remote.email, 'ayu@gmail.com');
+});
+
+test('exchangeAuthCode: bagian yang hilang tidak dikirim', async () => {
+  const { calls, remote } = harness({ handlers: { '/auth/v1/token': () => respond(200, TOKEN) } });
+  await assert.rejects(() => remote.exchangeAuthCode('CODE', null), /tidak lengkap/);
+  await assert.rejects(() => remote.exchangeAuthCode(null, 'V'), /tidak lengkap/);
+  assert.equal(calls.length, 0);
+});
+
+test('adoptTokenPayload: link recovery (implicit) langsung jadi sesi', () => {
+  const { remote } = harness({ handlers: {} });
+  const s = remote.adoptTokenPayload({
+    access_token: 'AT9',
+    refresh_token: 'RT9',
+    expires_in: 3600,
+    token_type: 'bearer',
+  });
+  assert.equal(s.access_token, 'AT9');
+  assert.equal(remote.signedIn, true);
+  // user tidak ikut di fragment: email diisi dari JWT, bukan dari paket ini.
+  assert.equal(remote.email, null);
+});
+
+test('isAdmin: hanya true kalau Postgres menjawab true', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/rpc/is_admin': () => respond(200, true),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.isAdmin(), true);
+  assert.equal(calls[1].init.headers.Authorization, 'Bearer AT1');
+  assert.deepEqual(calls[1].body, {});
+});
+
+test('isAdmin: akun yang login tapi tidak ada di daftar → false', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/rpc/is_admin': () => respond(200, false),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.isAdmin(), false);
+});
+
+test('isAdmin: tanpa sesi tidak bertanya, dan kegagalan tidak dianggap admin', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/rpc/is_admin': () => respond(401, { message: 'row-level security' }),
+    },
+  });
+  assert.equal(await remote.isAdmin(), false);
+  assert.equal(calls.length, 0, ' jangan pernah memanggil RPC sebelum ada token');
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.isAdmin(), false);
+});
+
+test('isAdmin: jawaban yang bukan boolean bukan izin', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/rpc/is_admin': () => respond(200, { error: 'function not found' }),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.isAdmin(), false);
+});
+

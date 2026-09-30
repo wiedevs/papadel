@@ -1,7 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createSession } from '../src/engine.mjs';
-import { toRow, fromRow, splitSessions, createSyncQueue } from '../src/cloud.mjs';
+import {
+  toRow,
+  fromRow,
+  splitSessions,
+  createSyncQueue,
+  createPkcePair,
+  buildAuthorizeUrl,
+  parseAuthRedirect,
+  cleanAuthUrl,
+} from '../src/cloud.mjs';
 
 const mk = (over = {}) =>
   createSession({
@@ -134,3 +143,75 @@ test('queue: tulis tanpa id diabaikan', async () => {
   await flushQueue(q);
   assert.equal(calls, 0);
 });
+
+// --- alur login: OAuth PKCE + tautan atur ulang -----------------------------
+
+test('parseAuthRedirect: kode PKCE ada di query', () => {
+  assert.deepEqual(parseAuthRedirect({ search: '?code=abc123&state=x' }), { kind: 'code', code: 'abc123' });
+});
+
+test('parseAuthRedirect: token implisit + penanda recovery', () => {
+  const out = parseAuthRedirect({
+    hash: '#access_token=AT&refresh_token=RT&expires_in=3600&token_type=bearer&type=recovery&provider_token=goog',
+  });
+  assert.equal(out.kind, 'token');
+  assert.equal(out.recovery, true);
+  assert.equal(out.session.access_token, 'AT');
+  assert.equal(out.session.refresh_token, 'RT');
+  assert.equal(out.session.expires_in, 3600);
+});
+
+test('parseAuthRedirect: tanpa token tidak dianggap login', () => {
+  assert.equal(parseAuthRedirect({}), null);
+  assert.equal(parseAuthRedirect({ search: '?view=live' }), null);
+  assert.equal(parseAuthRedirect({ hash: '#section-2' }), null);
+});
+
+test('parseAuthRedirect: error dari provider jadi pesan, bukan sesi', () => {
+  const out = parseAuthRedirect({ hash: '#error=access_denied&error_description=User+closed+window' });
+  assert.equal(out.kind, 'error');
+  assert.equal(out.message, 'User closed window');
+});
+
+test('parseAuthRedirect: recovery link datang sebagai query (?code=)', () => {
+  assert.deepEqual(parseAuthRedirect({ search: '?code=zz', hash: '' }), { kind: 'code', code: 'zz' });
+});
+
+test('buildAuthorizeUrl: pkce hanya kalau ada challenge', () => {
+  const withPkce = new URL(
+    buildAuthorizeUrl({ url: 'https://x.supabase.co', provider: 'google', redirectTo: 'https://p.test/papadel/', challenge: 'CH' })
+  );
+  assert.equal(withPkce.pathname, '/auth/v1/authorize');
+  assert.equal(withPkce.searchParams.get('provider'), 'google');
+  assert.equal(withPkce.searchParams.get('flow_type'), 'pkce');
+  assert.equal(withPkce.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(withPkce.searchParams.get('redirect_to'), 'https://p.test/papadel/');
+
+  const plain = new URL(buildAuthorizeUrl({ url: 'https://x.supabase.co', provider: 'google', redirectTo: 'https://p.test/' }));
+  assert.equal(plain.searchParams.has('flow_type'), false);
+  assert.throws(() => buildAuthorizeUrl({ url: 'https://x.supabase.co', redirectTo: 'https://p.test/' }), /Provider/);
+});
+
+test('createPkcePair: base64url aman dan challenge != verifier', async () => {
+  const { verifier, challenge } = await createPkcePair();
+  for (const v of [verifier, challenge]) {
+    assert.match(v, /^[A-Za-z0-9_-]+$/);
+    assert.doesNotMatch(v, /[+/=]/);
+  }
+  assert.ok(verifier.length >= 43, 'verifier harus >=32 byte entropy');
+  assert.notEqual(verifier, challenge);
+  const again = await createPkcePair();
+  assert.notEqual(again.verifier, verifier);
+});
+
+test('cleanAuthUrl: buang bekas login, simpan param asli', () => {
+  const cleaned = cleanAuthUrl(
+    'https://p.test/papadel/?code=abc&view=live#access_token=AT&refresh_token=RT&expires_in=3600&token_type=bearer&type=recovery'
+  );
+  assert.equal(cleaned, 'https://p.test/papadel/?view=live');
+});
+
+test('cleanAuthUrl: fragment non-auth tetap utuh', () => {
+  assert.equal(cleanAuthUrl('https://p.test/papadel/#top'), 'https://p.test/papadel/#top');
+});
+

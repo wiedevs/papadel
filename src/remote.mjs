@@ -109,6 +109,50 @@ export function createRemote({
     return adopt(data);
   }
 
+  // GoTrue answers 200 whether or not the address has an account, so the UI
+  // must not claim a mail was sent to a specific one.
+  async function recover(email) {
+    return request('/auth/v1/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: { email: String(email ?? '').trim() },
+    });
+  }
+
+  // PKCE callback: the one-time code plus the verifier this tab generated.
+  async function exchangeAuthCode(code, codeVerifier) {
+    if (!code || !codeVerifier) throw new Error('Kode login tidak lengkap.');
+    return adopt(
+      await request('/auth/v1/token?grant_type=pkce', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { auth_code: code, code_verifier: codeVerifier },
+      })
+    );
+  }
+
+  // Implicit callback (recovery links and providers without PKCE).
+  function adoptTokenPayload(payload) {
+    return adopt(payload);
+  }
+
+  // Not every signed-in account may write: see 0002_admin_allowlist.sql. The
+  // server is still the one that decides; this only tells the UI which buttons
+  // to hide.
+  async function isAdmin() {
+    if (!session) return false;
+    try {
+      const out = await authorized('/rest/v1/rpc/is_admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: {},
+      });
+      return out === true;
+    } catch {
+      return false;
+    }
+  }
+
   async function signOut() {
     const token = session?.access_token;
     session = null;
@@ -131,6 +175,10 @@ export function createRemote({
     signIn,
     signOut,
     refresh,
+    recover,
+    exchangeAuthCode,
+    adoptTokenPayload,
+    isAdmin,
 
     // A stored refresh token outlives the one-hour access token, so reopening
     // the page restores admin without typing the password again.

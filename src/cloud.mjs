@@ -7,6 +7,87 @@
 
 export const ROW_COLUMNS = ['id', 'doc'];
 
+// ---------------------------------------------------------------------------
+// Alur login: lupa sandi + OAuth
+// ---------------------------------------------------------------------------
+
+const VERIFIER_BYTES = 32;
+
+function toBase64Url(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// PKCE: verifier stays in this tab, the server only ever sees its SHA-256.
+export async function createPkcePair(webCrypto = globalThis.crypto) {
+  const bytes = new Uint8Array(VERIFIER_BYTES);
+  webCrypto.getRandomValues(bytes);
+  const verifier = toBase64Url(bytes);
+  const digest = new Uint8Array(await webCrypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  return { verifier, challenge: toBase64Url(digest) };
+}
+
+export function buildAuthorizeUrl({ url, provider, redirectTo, challenge }) {
+  if (!provider) throw new Error('Provider login tidak disebut.');
+  const q = new URLSearchParams({ provider, redirect_to: redirectTo });
+  if (challenge) {
+    q.set('flow_type', 'pkce');
+    q.set('code_challenge', challenge);
+    q.set('code_challenge_method', 'S256');
+  }
+  return `${url}/auth/v1/authorize?${q.toString()}`;
+}
+
+// Supabase hands the result back two ways: a `code` in the query (PKCE) or the
+// tokens in the fragment (implicit). Recovery links arrive the same way, tagged
+// `type=recovery`, so one reader covers both.
+export function parseAuthRedirect({ search = '', hash = '' } = {}) {
+  const query = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  const frag = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+  const pick = (name) => query.get(name) ?? frag.get(name);
+  const code = pick('code');
+  if (code) return { kind: 'code', code };
+  if (pick('error_description') || pick('error')) {
+    return { kind: 'error', message: pick('error_description') || pick('error') };
+  }
+  const access = pick('access_token');
+  if (!access) return null;
+  return {
+    kind: 'token',
+    session: {
+      access_token: access,
+      refresh_token: pick('refresh_token'),
+      expires_in: Number(pick('expires_in')) || 3600,
+      token_type: pick('token_type'),
+    },
+    recovery: pick('type') === 'recovery',
+  };
+}
+
+// The tokens sit in the address bar; leaving them there risks browser history
+// and a shoulder. Strip only the auth parts, keep real query params.
+const FRAGMENT_AUTH_KEYS = [
+  'access_token',
+  'refresh_token',
+  'expires_in',
+  'token_type',
+  'type',
+  'provider_token',
+];
+
+export function cleanAuthUrl(href) {
+  const u = new URL(href);
+  for (const k of ['code', 'state']) u.searchParams.delete(k);
+  if (![...u.searchParams.keys()].length) u.search = '';
+  const raw = u.hash.startsWith('#') ? u.hash.slice(1) : u.hash;
+  if (!raw || !FRAGMENT_AUTH_KEYS.some((k) => new URLSearchParams(raw).has(k))) return u.toString();
+  const rest = [...new URLSearchParams(raw)].filter(([k]) => !FRAGMENT_AUTH_KEYS.includes(k));
+  u.hash = rest.length ? `#${new URLSearchParams(rest).toString()}` : '';
+  return u.toString();
+}
+
+
 export function toRow(session) {
   if (!session || typeof session !== 'object' || !session.id) return null;
   return { id: session.id, doc: session };

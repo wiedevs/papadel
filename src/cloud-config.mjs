@@ -7,3 +7,8 @@
 // the client, or in a commit — test/secret-leak.test.mjs enforces that.
 export const SUPABASE_URL = "https://abjtyduurdbytdwbklsb.supabase.co";
 export const SUPABASE_ANON_KEY = "sb_publishable_Btc5NS3SeFmQqCbEGiPFLg_KSZkpQ8W";
+
+// Flip to true only after the Google provider is enabled in Supabase Auth and
+// its OAuth client secret lives server-side. The client never holds that
+// secret: /auth/v1/authorize takes the provider name and Supabase adds it.
+export const GOOGLE_LOGIN = false;
