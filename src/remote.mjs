@@ -6,7 +6,7 @@
 // `authenticated` role. Without one the same endpoints still answer SELECT
 // (policy "sessions readable by everyone") and refuse every write.
 
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from './cloud-config.mjs';
+import { SUPABASE_URL, SUPABASE_ANON_KEY, LOGIN_ALIASES } from './cloud-config.mjs';
 
 const TIMEOUT_MS = 15_000;
 // Refresh this early so a save never races the expiry of the token it needs.
@@ -100,11 +100,19 @@ export function createRemote({
     }
   };
 
+  // Lets the admin type `admin` where a login is expected. The alias only picks
+  // which account to authenticate as — the secret is still checked by GoTrue —
+  // so this is a shortcut, not a second door.
+  function resolveLogin(name) {
+    const key = String(name ?? '').trim().toLowerCase();
+    return LOGIN_ALIASES[key] ?? String(name ?? '').trim();
+  }
+
   async function signIn(email, password) {
     const data = await request('/auth/v1/token?grant_type=password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: { email: String(email ?? '').trim(), password: String(password ?? '') },
+      body: { email: resolveLogin(email), password: String(password ?? '') },
     });
     return adopt(data);
   }
@@ -115,8 +123,8 @@ export function createRemote({
   // out. The token is fetched only to learn whether it was accepted, then
   // dropped on the floor.
   async function verifyPassword(password) {
-    const email = session?.email;
-    if (!email) return false;
+    const email = resolveLogin(session?.email);
+    if (!email || !session) return false;
     try {
       await request('/auth/v1/token?grant_type=password', {
         method: 'POST',

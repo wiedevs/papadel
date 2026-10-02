@@ -12,3 +12,11 @@ export const SUPABASE_ANON_KEY = "sb_publishable_Btc5NS3SeFmQqCbEGiPFLg_KSZkpQ8W
 // its OAuth client secret lives server-side. The client never holds that
 // secret: /auth/v1/authorize takes the provider name and Supabase adds it.
 export const GOOGLE_LOGIN = false;
+
+// Usernames that stand in for a real login address, so the admin can type
+// `admin` instead of an email. Only the mapping lives here — the password is
+// never in this file, let alone in the repo. GoTrue still checks it against
+// the account this alias points at, so this grants nothing on its own.
+export const LOGIN_ALIASES = {
+  admin: 'wiedevs@gmail.com',
+};

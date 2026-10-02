@@ -254,6 +254,14 @@ test('recover: email kosong ditolak server, bukan oleh klien', async () => {
 
 // --- ganti kata sandi ------------------------------------------------------
 
+test('signIn: alias username dipetakan ke email, email asli tidak diubah', async () => {
+  const { calls, remote } = harness({ handlers: { '/auth/v1/token': () => respond(200, TOKEN) } });
+  await remote.signIn('admin', 'pw');
+  assert.equal(calls[0].body.email, 'wiedevs@gmail.com', 'alias harus jadi email tujuan');
+  await remote.signIn('  Other@Example.com ', 'pw');
+  assert.equal(calls[1].body.email, 'Other@Example.com', 'alamat lain diteruskan apa adanya');
+});
+
 test('updatePassword: memakai token sesi, bukan anon key', async () => {
   const { calls, remote } = harness({
     handlers: {

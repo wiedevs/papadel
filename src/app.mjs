@@ -675,7 +675,9 @@ function openUnlockDialog(mode = 'signin') {
   if (!$unlockDialog) return;
   unlockMode = mode;
   $unlockDialog.innerHTML = unlockDialogHtml();
-  $unlockDialog.showModal();
+  // Switching modes re-opens the same dialog (sign in → change password), and
+  // showModal() throws if it is already open, so the guard matters here.
+  if (!$unlockDialog.open) $unlockDialog.showModal();
   document.getElementById(dialogFocusId())?.focus();
 }
 
@@ -1481,6 +1483,10 @@ $roleToggle?.addEventListener('click', async (e) => {
     openUnlockDialog();
     return;
   }
+  if (e.target.closest('[data-action="show-change-password"]')) {
+    openUnlockDialog('change-password');
+    return;
+  }
   if (e.target.closest('[data-action="sign-out"]')) {
     await cloudSignOut();
     return;
@@ -1549,10 +1555,6 @@ $unlockDialog?.addEventListener('click', async (e) => {
   }
   if (e.target.closest('[data-action="back-to-signin"]')) {
     openUnlockDialog('signin');
-    return;
-  }
-  if (e.target.closest('[data-action="show-change-password"]')) {
-    openUnlockDialog('change-password');
     return;
   }
   const google = e.target.closest('[data-action="oauth-google"]');
