@@ -33,6 +33,7 @@ import {
   actionForClick,
   actionForSubmit,
   can,
+  isDestructiveAction,
   normalizeRole,
   verifyPasscode,
 } from './authz.mjs';
@@ -132,20 +133,30 @@ function storeAuthSession() {
   }
 }
 
-// In cloud mode the role is a fact about the token, not a preference. Two
-// things have to hold before the server will accept a write: a signed-in JWT,
-// and that email listed in public.admins (0002). A Google account that is not
-// on the list signs in as a reader, so offering it admin buttons would be
-// theatre — and a denied request, not a UI.
+// In cloud mode the role is a fact about the token, not a preference. Three
+// things have to hold, and they are asked separately because each is a separate
+// RLS policy: a signed-in JWT (0001), that email listed in public.admins
+// (0002), and in public.superadmins for anything destructive (0003). A Google
+// account that is not on a list signs in as a reader, so offering it admin
+// buttons would be theatre — and a denied request, not a UI.
 let cloudAdmin = false;
+let cloudSuperAdmin = false;
+// The two allowlists as Sets. Only ever populated for a signed-in admin, since
+// that is the most any role may read.
+let roleLists = { admins: new Set(), superadmins: new Set() };
 
 async function refreshCloudAdmin() {
   cloudAdmin = cloudAvailable ? remote.signedIn && (await remote.isAdmin()) : true;
+  // Assumed from cloudAdmin rather than re-asked: only superadmins are also
+  // admins, so this can never grant more than the previous answer allowed.
+  cloudSuperAdmin = cloudAdmin && (!cloudAvailable || (await remote.isSuperAdmin()));
   return cloudAdmin;
 }
 
 function adoptCloudRole() {
-  setRole(remote.signedIn && cloudAdmin ? ROLES[0] : ROLES[1]);
+  setRole(
+    cloudSuperAdmin ? ROLES[0] : cloudAdmin ? ROLES[1] : ROLES[2]
+  );
 }
 
 // Supabase returns from /authorize and from recovery links on this same URL.
@@ -215,6 +226,7 @@ async function bootCloud() {
     // A boot that never finished cannot claim the token that would be needed to
     // honour the role left over in localStorage.
     cloudAdmin = false;
+    cloudSuperAdmin = false;
     adoptCloudRole();
   }
   closeEditors();
@@ -243,6 +255,7 @@ async function cloudSignOut() {
   await remote.signOut();
   storeAuthSession();
   cloudAdmin = false;
+  cloudSuperAdmin = false;
   adoptCloudRole();
   closeEditors();
   applyChrome();
@@ -326,9 +339,11 @@ function cloudLabel() {
   if (cloudPhase === 'error') return t('cloud.error');
   if (cloudPhase === 'offline') return t('cloud.offline');
   return remote.signedIn
-    ? cloudAdmin
-      ? t('cloud.synced')
-      : t('cloud.signedReadonly')
+    ? cloudSuperAdmin
+      ? t('cloud.syncedSuper')
+      : cloudAdmin
+        ? t('cloud.synced')
+        : t('cloud.signedReadonly')
     : t('cloud.readonly');
 }
 
@@ -505,14 +520,23 @@ function applyChrome() {
 //
 // With a shared board the local role alone is not enough: without a signed-in
 // token every write comes back as a rejection, so the controls stay hidden.
+// The token check is answered per action, not once — Postgres gates INSERT and
+// UPDATE on is_admin() but DELETE on is_superadmin(), so an admin's session is
+// honest about writing and honest about not destroying.
 function canWrite(action) {
   if (!can(role, action)) return false;
-  return !cloudAvailable || (remote.signedIn && cloudAdmin);
+  if (!cloudAvailable) return true;
+  if (!remote.signedIn) return false;
+  return isDestructiveAction(action) ? cloudSuperAdmin : cloudAdmin;
 }
 
 function guardWrite(action) {
   if (action === null || canWrite(action)) return true;
-  flashMsg(t('toast.forbidden'));
+  flashMsg(
+    action && isDestructiveAction(action) && cloudAdmin && !cloudSuperAdmin
+      ? t('toast.needSuperadmin')
+      : t('toast.forbidden')
+  );
   render();
   return false;
 }
@@ -902,8 +926,9 @@ function sparkline(values) {
 
 function render() {
   // A viewer has no setup form to land on, so the create-only view is swapped
-  // for whatever is readable.
+  // for whatever is readable. Same for the admin menu, which is staff-only.
   if (view === 'setup' && !canWrite(ACTIONS.SESSION_CREATE)) view = current ? 'live' : 'leaderboard';
+  if (view === 'admin' && !canWrite(ACTIONS.USER_MANAGE)) view = current ? 'live' : 'leaderboard';
   renderNav();
   renderLangToggle();
   renderRoleToggle();
@@ -913,6 +938,7 @@ function render() {
     seedDraftFromRecent();
     $app.innerHTML = setupView();
   } else if (view === 'live') $app.innerHTML = liveView();
+  else if (view === 'admin') $app.innerHTML = adminView();
   else $app.innerHTML = leaderboardView();
 }
 
@@ -921,7 +947,12 @@ function renderNav() {
     ['setup', t('nav.setup')],
     ['live', t('nav.live')],
     ['leaderboard', t('nav.leaderboard')],
-  ].filter(([v]) => v !== 'setup' || canWrite(ACTIONS.SESSION_CREATE));
+    ['admin', t('nav.admin')],
+  ].filter(
+    ([v]) =>
+      (v !== 'setup' || canWrite(ACTIONS.SESSION_CREATE)) &&
+      (v !== 'admin' || canWrite(ACTIONS.USER_MANAGE))
+  );
   $nav.innerHTML = items
     .map(
       ([v, label]) =>
@@ -1158,6 +1189,118 @@ function liveView() {
       <div>${playersCard}</div>
       <div>${upcomingCard}</div>
     </div>`;
+}
+
+// --- Admin view --------------------------------------------------------------
+
+// Only the two allowlists are readable here (0002 gives an admin their own
+// row, 0003 does the same for superadmins), so the list is built from those
+// rather than from auth.users — which no role may enumerate.
+function roleOf(email) {
+  const key = String(email ?? '').toLowerCase();
+  if (roleLists.superadmins.has(key)) return 'superadmin';
+  if (roleLists.admins.has(key)) return 'admin';
+  return 'viewer';
+}
+
+function knownAccounts() {
+  return [...new Set([...roleLists.admins, ...roleLists.superadmins])].sort();
+}
+
+function roleTag(role) {
+  return `<span class="tag ${role === 'superadmin' ? 'play' : role === 'admin' ? 'wait' : ''}">${t(`role.${role}`)}</span>`;
+}
+
+function roleRow(email) {
+  const role = roleOf(email);
+  const me = remote.email && String(remote.email).toLowerCase() === email;
+  // Removing your own superadmin row is the one action the trigger will refuse
+  // if you are the last one, so the button is hidden rather than left to fail.
+  const lastSuper = roleLists.superadmins.size <= 1;
+  const canRevoke = canWrite(ACTIONS.USER_MANAGE) && !(me && role === 'superadmin' && lastSuper);
+  return `<tr>
+    <td>${esc(email)}${me ? ` <span class="muted">${t('admin.you')}</span>` : ''}</td>
+    <td>${roleTag(role)}</td>
+    <td class="actions-col">
+      ${canWrite(ACTIONS.USER_MANAGE) ? `
+        <form class="row" id="f-role" data-email="${esc(email)}">
+          <select class="mini-select" name="role">
+            ${role === 'admin' ? '' : `<option value="admin">${t('role.admin')}</option>`}
+            ${role === 'superadmin' ? '' : `<option value="superadmin">${t('role.superadmin')}</option>`}
+            ${role === 'viewer' ? `<option value="viewer" selected>${t('role.viewer')}</option>` : ''}
+          </select>
+          <button class="btn-xs primary" type="submit">${t('admin.save')}</button>
+          ${canRevoke ? `<button class="btn-xs danger" type="button" data-action="revoke-role" data-email="${esc(email)}" data-role="${role}">${t('admin.revoke')}</button>` : ''}
+        </form>` : ''}
+    </td>
+  </tr>`;
+}
+
+function adminView() {
+  return `
+    <section class="card">
+      <h2>${t('admin.title')}</h2>
+      <p class="muted">${t('admin.hint')}</p>
+      ${canWrite(ACTIONS.USER_MANAGE) ? `
+        <form id="f-role" class="row" data-email="" data-new="1">
+          <input name="email" type="email" class="mini-input wide" placeholder="${t('admin.newEmail')}" required>
+          <select class="mini-select" name="role">
+            <option value="admin">${t('role.admin')}</option>
+            <option value="superadmin">${t('role.superadmin')}</option>
+          </select>
+          <button class="btn primary" type="submit">${t('admin.grant')}</button>
+        </form>` : `<p class="muted">${t('role.superadmin.badge')}</p>`}
+    </section>
+    <section class="card">
+      <h2>${t('admin.people')} <span class="count">${knownAccounts().length}</span></h2>
+      ${
+        knownAccounts().length
+          ? `<div style="overflow-x:auto"><table class="tbl">
+              <thead><tr><th>${t('admin.email')}</th><th>${t('admin.role')}</th><th>${t('admin.actions')}</th></tr></thead>
+              <tbody>${knownAccounts().map(roleRow).join('')}</tbody>
+            </table></div>`
+          : `<p class="muted">${t('admin.empty')}</p>`
+      }
+    </section>`;
+}
+
+async function refreshRoleLists() {
+  if (!remote.signedIn || !cloudAdmin) {
+    roleLists = { admins: new Set(), superadmins: new Set() };
+    return roleLists;
+  }
+  try {
+    roleLists = await remote.fetchRoles();
+  } catch {
+    roleLists = { admins: new Set(), superadmins: new Set() };
+  }
+  return roleLists;
+}
+
+// One place for both directions, because they share the awkward part: the
+// server refuses some of them (the last superadmin, per the 0003 trigger) and
+// the refusal is the only thing that must reach the person who pressed the
+// button. After a change the lists are re-read rather than patched locally —
+// a partial success (superadmins row written, admins row not) would otherwise
+// leave the UI claiming something the server disagrees with.
+async function changeRole(email, from, to) {
+  try {
+    if (to === 'viewer') await remote.revokeRole(email, from);
+    else await remote.grantRole(email, to);
+    await refreshRoleLists();
+    // A change to your own role is not reflected until the token is re-asked,
+    // so the view is refreshed rather than left showing the old buttons.
+    if (remote.email && String(remote.email).toLowerCase() === String(email).toLowerCase()) {
+      await refreshCloudAdmin();
+      adoptCloudRole();
+    }
+    flashMsg(t('toast.roleChanged', { email, role: t(`role.${to}`) }), 'ok');
+    render();
+    return true;
+  } catch (err) {
+    flashMsg(err?.message || t('toast.roleChangeFail'));
+    return false;
+  }
 }
 
 // --- Leaderboard & history view ----------------------------------------------
@@ -1454,11 +1597,14 @@ function endSessionFlow() {
 // Events
 // ---------------------------------------------------------------------------
 
-$nav.addEventListener('click', (e) => {
+$nav.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-action="nav"]');
   if (!el || el.disabled) return;
   view = el.dataset.view;
   closeEditors();
+  // The admin view reads the allowlists, so they are fetched when it is opened
+  // rather than kept warm behind every other screen.
+  if (view === 'admin') await refreshRoleLists();
   render();
 });
 
@@ -1569,7 +1715,7 @@ $unlockDialog?.addEventListener('click', async (e) => {
   }
 });
 
-$app.addEventListener('click', (e) => {
+$app.addEventListener('click', async (e) => {
   const dateInput = e.target.closest('input[type="date"]');
   if (dateInput && !dateInput.readOnly) {
     try { dateInput.showPicker(); } catch { /* older browsers: icon still works */ }
@@ -1679,6 +1825,10 @@ $app.addEventListener('click', (e) => {
   } else if (d.action === 'edit-meta') {
     editingMeta = true;
     render();
+  } else if (d.action === 'revoke-role') {
+    if (confirm(t('confirm.revokeRole', { email: d.email, role: t(`role.${d.role}`) }))) {
+      await changeRole(d.email, d.role, 'viewer');
+    }
   } else if (d.action === 'cancel-meta') {
     clearDraft(`meta:${session.id}`);
     editingMeta = false;
@@ -1720,7 +1870,7 @@ $app.addEventListener('input', (e) => {
   fields[el.dataset.field] = el.value;
 });
 
-$app.addEventListener('submit', (e) => {
+$app.addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
   const required = actionForSubmit(form);
@@ -1829,6 +1979,16 @@ $app.addEventListener('submit', (e) => {
     clearDraft(`player:${form.dataset.id}`);
     flashMsg(t('toast.playerRenamed'), 'ok');
     render();
+  } else if (form.id === 'f-role') {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    const next = form.querySelector('select[name="role"]')?.value ?? '';
+    // The "add someone new" form carries the address in its input; the per-row
+    // form carries it in data-email, since its own input is only a selector.
+    const email = form.dataset.email || form.querySelector('input[name="email"]')?.value || '';
+    const from = form.dataset.email ? roleOf(form.dataset.email) : 'viewer';
+    await changeRole(email.trim(), from, next);
+    if (submit) submit.disabled = false;
   }
 });
 

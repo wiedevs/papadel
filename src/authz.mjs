@@ -1,8 +1,12 @@
 // PaPadel authorization — pure role policy: no DOM, no storage, no engine state.
 // Action names are `resource.verb` so each rule ports to a Supabase RLS policy
 // of the same shape when the prototype is replaced by the real stack.
+//
+// Three roles, split along one line: writing a session in is everyone's job,
+// destroying one is not. Supabase mirrors this exactly — INSERT/UPDATE are
+// gated on public.is_admin(), DELETE on public.is_superadmin() (migration 0003).
 
-export const ROLES = ['admin', 'viewer'];
+export const ROLES = ['superadmin', 'admin', 'viewer'];
 
 // Least privilege: a fresh browser reads until it is switched to admin.
 export const DEFAULT_ROLE = 'viewer';
@@ -19,23 +23,27 @@ export const ACTIONS = {
   PLAYER_UPDATE: 'player.update',
   PLAYER_DELETE: 'player.delete',
   DATA_WIPE: 'data.wipe',
+  USER_MANAGE: 'user.manage',
 };
 
-const BOTH = [ROLES[0], ROLES[1]];
-const ADMIN = [ROLES[0]];
+const ALL = ROLES;
+const STAFF = [ROLES[0], ROLES[1]];
+const SUPERADMIN = [ROLES[0]];
 
 const POLICY = {
-  [ACTIONS.DATA_READ]: BOTH,
-  [ACTIONS.SESSION_CREATE]: ADMIN,
-  [ACTIONS.SESSION_UPDATE]: ADMIN,
-  [ACTIONS.SESSION_DELETE]: ADMIN,
-  [ACTIONS.ROUND_SCORE]: ADMIN,
-  [ACTIONS.ROUND_UPDATE]: ADMIN,
-  [ACTIONS.ROUND_DELETE]: ADMIN,
-  [ACTIONS.PLAYER_CREATE]: ADMIN,
-  [ACTIONS.PLAYER_UPDATE]: ADMIN,
-  [ACTIONS.PLAYER_DELETE]: ADMIN,
-  [ACTIONS.DATA_WIPE]: ADMIN,
+  [ACTIONS.DATA_READ]: ALL,
+  [ACTIONS.SESSION_CREATE]: STAFF,
+  [ACTIONS.SESSION_UPDATE]: STAFF,
+  [ACTIONS.ROUND_SCORE]: STAFF,
+  [ACTIONS.ROUND_UPDATE]: STAFF,
+  [ACTIONS.PLAYER_CREATE]: STAFF,
+  [ACTIONS.PLAYER_UPDATE]: STAFF,
+  // Everything below destroys data or people, so it never reaches admin.
+  [ACTIONS.SESSION_DELETE]: SUPERADMIN,
+  [ACTIONS.ROUND_DELETE]: SUPERADMIN,
+  [ACTIONS.PLAYER_DELETE]: SUPERADMIN,
+  [ACTIONS.DATA_WIPE]: SUPERADMIN,
+  [ACTIONS.USER_MANAGE]: SUPERADMIN,
 };
 
 // Unknown role or unknown action denies, so a new action added without a rule
@@ -51,6 +59,12 @@ export function normalizeRole(raw) {
 }
 
 export function isWriteAction(action) {
+  return can(ROLES[1], action) && !can(ROLES[2], action);
+}
+
+// The actions Postgres refuses for this role but would allow for a superadmin.
+// The UI uses this to explain a hidden control rather than silently dropping it.
+export function isDestructiveAction(action) {
   return can(ROLES[0], action) && !can(ROLES[1], action);
 }
 
@@ -68,12 +82,13 @@ export const CLICK_ACTION = {
   'save-score': ACTIONS.ROUND_UPDATE,
   'edit-score': ACTIONS.ROUND_UPDATE,
   'edit-teams': ACTIONS.ROUND_UPDATE,
-  'delete-round': ACTIONS.ROUND_DELETE,
   'rename-player': ACTIONS.PLAYER_UPDATE,
   'remove-player': ACTIONS.PLAYER_UPDATE,
   'remove-session-player': ACTIONS.PLAYER_DELETE,
+  'delete-round': ACTIONS.ROUND_DELETE,
   'delete-session': ACTIONS.SESSION_DELETE,
   'discard-live': ACTIONS.SESSION_DELETE,
+  'revoke-role': ACTIONS.USER_MANAGE,
 };
 
 export const SUBMIT_ACTION = {
@@ -84,6 +99,7 @@ export const SUBMIT_ACTION = {
   'f-meta': ACTIONS.SESSION_UPDATE,
   'teams-edit': ACTIONS.ROUND_UPDATE,
   'player-edit': ACTIONS.PLAYER_UPDATE,
+  'f-role': ACTIONS.USER_MANAGE,
 };
 
 export function actionForClick(uiAction) {
@@ -101,9 +117,9 @@ export function actionForSubmit(form) {
 // --- Prototype passcode gate -------------------------------------------------
 // This is a demo affordance, not a credential: the check runs in the visitor's
 // own browser, so the code is readable in this file and the role can be set
-// directly in localStorage. It exists to make the two roles feel real while the
-// domain logic is being validated. Real sign-in belongs to Supabase Auth, where
-// the role comes from a server-signed token and `can()` becomes RLS policies.
+// directly in localStorage. It exists to make the three roles feel real while
+// the domain logic is being validated. Real sign-in belongs to Supabase Auth,
+// where the role comes from a server-signed token and `can()` becomes RLS.
 export const DEMO_ADMIN_PASSCODE = '2468';
 
 export function verifyPasscode(input, expected = DEMO_ADMIN_PASSCODE) {

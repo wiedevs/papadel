@@ -195,6 +195,69 @@ export function createRemote({
     }
   }
 
+  // Destructive actions and user management: see 0003_superadmin.sql. Asked
+  // separately from is_admin so the UI can offer a superadmin both answers and
+  // the client never assumes the first implies the second.
+  async function isSuperAdmin() {
+    if (!session) return false;
+    try {
+      const out = await authorized('/rest/v1/rpc/is_superadmin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: {},
+      });
+      return out === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Both lists at once: the admin menu shows every known account, so it needs
+  // to know which are staff and which are super.
+  async function fetchRoles() {
+    const read = async (table) => {
+      try {
+        const rows = await authorized(`/rest/v1/${table}?select=email`, { method: 'GET' });
+        return new Set((Array.isArray(rows) ? rows : []).map((r) => String(r?.email ?? '').toLowerCase()).filter(Boolean));
+      } catch {
+        return new Set();
+      }
+    };
+    const [admins, superadmins] = await Promise.all([read('admins'), read('superadmins')]);
+    return { admins, superadmins };
+  }
+
+  // Upsert so re-granting an existing address is a no-op rather than a conflict.
+  // A superadmin is always an admin too, so granting the higher role writes
+  // both tables — otherwise the UI would show someone as superadmin while
+  // Postgres refused their session writes.
+  async function grantRole(email, role) {
+    const address = String(email ?? '').trim().toLowerCase();
+    if (!address) throw new Error('Email kosong.');
+    if (!address.includes('@')) throw new Error('Email tidak valid.');
+    if (role !== 'admin' && role !== 'superadmin') throw new Error('Peran tidak dikenal.');
+    const put = (table) =>
+      authorized(`/rest/v1/${table}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: { email: address },
+      });
+    await put('admins');
+    if (role === 'superadmin') await put('superadmins');
+  }
+
+  // Removing admin is separate from removing superadmin: the second is what
+  // actually strips destructive power, and the trigger refuses to drop the last
+  // one — that rejection is surfaced, not swallowed.
+  async function revokeRole(email, role) {
+    const address = String(email ?? '').trim().toLowerCase();
+    if (!address) throw new Error('Email kosong.');
+    const del = (table) =>
+      authorized(`/rest/v1/${table}?email=eq.${encodeURIComponent(address)}`, { method: 'DELETE' });
+    if (role === 'superadmin') await del('superadmins');
+    await del('admins');
+  }
+
   async function signOut() {
     const token = session?.access_token;
     session = null;
@@ -223,6 +286,10 @@ export function createRemote({
     exchangeAuthCode,
     adoptTokenPayload,
     isAdmin,
+    isSuperAdmin,
+    fetchRoles,
+    grantRole,
+    revokeRole,
 
     // A stored refresh token outlives the one-hour access token, so reopening
     // the page restores admin without typing the password again.

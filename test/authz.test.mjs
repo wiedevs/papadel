@@ -12,6 +12,7 @@ import {
   can,
   normalizeRole,
   isWriteAction,
+  isDestructiveAction,
   writeActions,
   actionForClick,
   actionForSubmit,
@@ -22,9 +23,37 @@ import {
 const ALL_ACTIONS = Object.values(ACTIONS);
 const appSource = readFileSync(new URL('../src/app.mjs', import.meta.url), 'utf8');
 
-test('admin is allowed every action', () => {
+test('a superadmin is allowed every action', () => {
   for (const action of ALL_ACTIONS) {
+    assert.equal(can('superadmin', action), true, `superadmin denied ${action}`);
+  }
+});
+
+// The split the three roles exist for: an admin runs the session, but deleting
+// one — and managing who may delete — stays above that line.
+test('an admin writes but never destroys or manages users', () => {
+  const destructive = [
+    ACTIONS.SESSION_DELETE,
+    ACTIONS.ROUND_DELETE,
+    ACTIONS.PLAYER_DELETE,
+    ACTIONS.DATA_WIPE,
+    ACTIONS.USER_MANAGE,
+  ];
+  for (const action of destructive) {
+    assert.equal(can('admin', action), false, `admin was allowed ${action}`);
+    assert.equal(isDestructiveAction(action), true, `${action} is not classified destructive`);
+  }
+  const writable = [
+    ACTIONS.SESSION_CREATE,
+    ACTIONS.SESSION_UPDATE,
+    ACTIONS.ROUND_SCORE,
+    ACTIONS.ROUND_UPDATE,
+    ACTIONS.PLAYER_CREATE,
+    ACTIONS.PLAYER_UPDATE,
+  ];
+  for (const action of writable) {
     assert.equal(can('admin', action), true, `admin denied ${action}`);
+    assert.equal(isDestructiveAction(action), false, `${action} is wrongly destructive`);
   }
 });
 
@@ -39,7 +68,7 @@ test('a viewer may only read', () => {
 // action would mean the role model leaked.
 test('no write action is reachable by a viewer', () => {
   const writes = writeActions();
-  assert.ok(writes.length >= 9, `expected the write inventory, got ${writes.length}`);
+  assert.ok(writes.length >= 6, `expected the write inventory, got ${writes.length}`);
   for (const action of writes) {
     assert.equal(can('viewer', action), false);
     assert.equal(isWriteAction(action), true);
@@ -47,6 +76,7 @@ test('no write action is reachable by a viewer', () => {
 });
 
 test('an action with no rule denies instead of defaulting open', () => {
+  assert.equal(can('superadmin', 'session.drop'), false);
   assert.equal(can('admin', 'session.drop'), false);
   assert.equal(can('viewer', 'session.drop'), false);
   assert.equal(writeActions().includes('session.drop'), false);
@@ -78,7 +108,14 @@ test('every UI affordance maps to a real action', () => {
   const known = new Set(ALL_ACTIONS);
   for (const [ui, action] of [...Object.entries(CLICK_ACTION), ...Object.entries(SUBMIT_ACTION)]) {
     assert.equal(known.has(action), true, `${ui} maps to unknown action ${action}`);
-    assert.equal(isWriteAction(action), true, `${ui} maps ${action}, which is not a write`);
+    // Either an ordinary write (admin reaches it) or a destructive one
+    // (superadmin only) — both are writes, so both must be barred from viewer.
+    assert.equal(
+      isWriteAction(action) || isDestructiveAction(action),
+      true,
+      `${ui} maps ${action}, which is neither a write nor destructive`
+    );
+    assert.equal(can('viewer', action), false, `${ui} maps ${action}, which a viewer may do`);
   }
 });
 
@@ -148,8 +185,14 @@ test('actionForClick and actionForSubmit resolve writes and pass reads through a
   assert.equal(actionForSubmit(form('f-session-filter')), null);
 });
 
-test('ROLES lists exactly the two roles the policy distinguishes', () => {
-  assert.deepEqual(ROLES, ['admin', 'viewer']);
+// Order matters: superadmin first, because the UI and the tests read ROLES[0]
+// as the most privileged role.
+test('ROLES lists exactly the three roles the policy distinguishes', () => {
+  assert.deepEqual(ROLES, ['superadmin', 'admin', 'viewer']);
+});
+
+test('normalizeRole knows the new role', () => {
+  assert.equal(normalizeRole('superadmin'), 'superadmin');
 });
 
 // --- Prototype passcode gate -------------------------------------------------

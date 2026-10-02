@@ -300,6 +300,138 @@ test('updatePassword: 422 dari GoTrue diteruskan dengan pesannya', async () => {
   await assert.rejects(() => remote.updatePassword('rahasia123'), /different from the old/);
 });
 
+test('isSuperAdmin: hanya true kalau Postgres menjawab true', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/rpc/is_admin': () => respond(200, true),
+      '/rest/v1/rpc/is_superadmin': () => respond(200, true),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.isAdmin(), true);
+  assert.equal(await remote.isSuperAdmin(), true);
+  assert.equal(calls[2].path, '/rest/v1/rpc/is_superadmin');
+});
+
+// Admin is not superadmin: the RPC answers false for an allowlisted-but-not-
+// promoted account, and the UI must stop rendering destructive controls.
+test('isSuperAdmin: admin biasa dijawab false, bukan error', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/rpc/is_admin': () => respond(200, true),
+      '/rest/v1/rpc/is_superadmin': () => respond(200, false),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.isSuperAdmin(), false);
+  assert.equal(remote.signedIn, true);
+});
+
+test('grantRole: superadmin ditulis ke kedua tabel, admin hanya ke admins', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/admins': () => respond(201, null),
+      '/rest/v1/superadmins': () => respond(201, null),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  await remote.grantRole('  Editor@Example.com ', 'superadmin');
+  const paths = calls.slice(1).map((c) => c.path);
+  assert.deepEqual(paths, ['/rest/v1/admins', '/rest/v1/superadmins']);
+  assert.deepEqual(calls[1].body, { email: 'editor@example.com' }, 'email dinormalkan');
+  assert.match(calls[1].init.headers.Prefer, /merge-duplicates/, 'pemberian ulang bukan error');
+
+  const admin = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/admins': () => respond(201, null),
+      '/rest/v1/superadmins': () => respond(201, null),
+    },
+  });
+  await admin.remote.signIn('a@b.c', 'pw');
+  await admin.remote.grantRole('editor@example.com', 'admin');
+  assert.deepEqual(
+    admin.calls.slice(1).map((c) => c.path),
+    ['/rest/v1/admins'],
+    'admin tidak boleh ikut masuk superadmins'
+  );
+});
+
+test('grantRole: email tidak valid ditolak sebelum jaringan', async () => {
+  let sent = 0;
+  const remote = createRemote({
+    url: 'https://x.supabase.co',
+    anonKey: 'k',
+    fetchImpl: () => { sent += 1; throw new Error('tidak boleh dipanggil'); },
+  });
+  await assert.rejects(() => remote.grantRole('bukan-email', 'admin'), /tidak valid/);
+  await assert.rejects(() => remote.grantRole('', 'admin'), /kosong/);
+  await assert.rejects(() => remote.grantRole('a@b.c', 'wizard'), /tidak dikenal/);
+  assert.equal(sent, 0);
+});
+
+test('revokeRole: mencabut superadmin juga melepas admin', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/superadmins': () => respond(204, null),
+      '/rest/v1/admins': () => respond(204, null),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  await remote.revokeRole('editor@example.com', 'superadmin');
+  const paths = calls.slice(1).map((c) => c.path);
+  assert.deepEqual(paths, [
+    '/rest/v1/superadmins?email=eq.editor%40example.com',
+    '/rest/v1/admins?email=eq.editor%40example.com',
+  ]);
+  assert.equal(calls[1].init.method, 'DELETE');
+});
+
+test('revokeRole: superadmin terakhir yang ditolak server diteruskan', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/superadmins': () => respond(409, { message: 'Tidak bisa menghapus superadmin terakhir' }),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  // The trigger's refusal is the only thing the admin can act on, so it must
+  // not be flattened into a generic failure.
+  await assert.rejects(() => remote.revokeRole('a@b.c', 'superadmin'), /superadmin terakhir/);
+});
+
+test('fetchRoles: kedua allowlist jadi Set huruf kecil', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/admins': () => respond(200, [{ email: 'A@B.c' }, { email: 'd@e.f' }]),
+      '/rest/v1/superadmins': () => respond(200, [{ email: 'A@B.c' }]),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  const out = await remote.fetchRoles();
+  assert.deepEqual([...out.admins].sort(), ['a@b.c', 'd@e.f']);
+  assert.deepEqual([...out.superadmins], ['a@b.c']);
+});
+
+test('fetchRoles: allowlist yang tidak terbaca jadi kosong, bukan crash', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/rest/v1/admins': () => respond(403, { message: 'not allowed' }),
+      '/rest/v1/superadmins': () => respond(403, { message: 'not allowed' }),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  const out = await remote.fetchRoles();
+  assert.equal(out.admins.size, 0);
+  assert.equal(out.superadmins.size, 0);
+});
+
 test('verifyPassword: benar → true, dan sesi yang ada tidak terganti', async () => {
   const { calls, remote } = harness({
     handlers: { '/auth/v1/token': () => respond(200, { ...TOKEN, access_token: 'AT2' }) },
