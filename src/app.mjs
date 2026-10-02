@@ -143,7 +143,7 @@ let cloudAdmin = false;
 let cloudSuperAdmin = false;
 // The two allowlists as Sets. Only ever populated for a signed-in admin, since
 // that is the most any role may read.
-let roleLists = { admins: new Set(), superadmins: new Set() };
+let roleLists = { admins: new Set(), superadmins: new Set(), accounts: [] };
 
 async function refreshCloudAdmin() {
   cloudAdmin = cloudAvailable ? remote.signedIn && (await remote.isAdmin()) : true;
@@ -1202,9 +1202,11 @@ function liveView() {
 
 // --- Admin view --------------------------------------------------------------
 
-// Only the two allowlists are readable here (0002 gives an admin their own
-// row, 0003 does the same for superadmins), so the list is built from those
-// rather than from auth.users — which no role may enumerate.
+// Only the two allowlists and the account directory are readable here, so the
+// list is built from those rather than from auth.users — which no role may
+// enumerate. The directory is the source of who exists; the allowlists say who
+// may do what. An account can appear here with no role at all, which is exactly
+// the state a superadmin needs to see before granting one.
 function roleOf(email) {
   const key = String(email ?? '').toLowerCase();
   if (roleLists.superadmins.has(key)) return 'superadmin';
@@ -1212,15 +1214,34 @@ function roleOf(email) {
   return 'viewer';
 }
 
+// Everyone in the directory, plus anyone holding a role but missing from it —
+// a stale allowlist row is a real situation and should not silently vanish.
 function knownAccounts() {
-  return [...new Set([...roleLists.admins, ...roleLists.superadmins])].sort();
+  const seen = new Map();
+  for (const a of roleLists.accounts) seen.set(String(a.email).toLowerCase(), a);
+  for (const email of [...roleLists.admins, ...roleLists.superadmins]) {
+    if (!seen.has(email)) seen.set(email, { email });
+  }
+  return [...seen.values()].sort(
+    (a, b) => String(b.last_login_at ?? '').localeCompare(String(a.last_login_at ?? '')) || String(a.email).localeCompare(String(b.email))
+  );
+}
+
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString(dateLocale(), {
+    year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
 }
 
 function roleTag(role) {
   return `<span class="tag ${role === 'superadmin' ? 'play' : role === 'admin' ? 'wait' : ''}">${t(`role.${role}`)}</span>`;
 }
 
-function roleRow(email) {
+function roleRow(account) {
+  const email = String(account.email).toLowerCase();
   const role = roleOf(email);
   const me = remote.email && String(remote.email).toLowerCase() === email;
   // Removing your own superadmin row is the one action the trigger will refuse
@@ -1228,8 +1249,14 @@ function roleRow(email) {
   const lastSuper = roleLists.superadmins.size <= 1;
   const canRevoke = canWrite(ACTIONS.USER_MANAGE) && !(me && role === 'superadmin' && lastSuper);
   return `<tr>
-    <td>${esc(email)}${me ? ` <span class="muted">${t('admin.you')}</span>` : ''}</td>
+    <td>
+      ${esc(account.full_name || email)}${me ? ` <span class="muted">${t('admin.you')}</span>` : ''}
+      <div class="muted" style="font-size:12px">${esc(email)}</div>
+    </td>
     <td>${roleTag(role)}</td>
+    <td>${account.provider ? `<span class="tag">${esc(account.provider)}</span>` : '—'}</td>
+    <td>${esc(fmtWhen(account.first_login_at))}</td>
+    <td>${esc(fmtWhen(account.last_login_at))}</td>
     <td class="actions-col">
       ${canWrite(ACTIONS.USER_MANAGE) ? `
         <form class="row" id="f-role" data-email="${esc(email)}">
@@ -1265,7 +1292,10 @@ function adminView() {
       ${
         knownAccounts().length
           ? `<div style="overflow-x:auto"><table class="tbl">
-              <thead><tr><th>${t('admin.email')}</th><th>${t('admin.role')}</th><th>${t('admin.actions')}</th></tr></thead>
+              <thead><tr>
+                <th>${t('admin.who')}</th><th>${t('admin.role')}</th><th>${t('admin.via')}</th>
+                <th>${t('admin.firstLogin')}</th><th>${t('admin.lastLogin')}</th><th>${t('admin.actions')}</th>
+              </tr></thead>
               <tbody>${knownAccounts().map(roleRow).join('')}</tbody>
             </table></div>`
           : `<p class="muted">${t('admin.empty')}</p>`
@@ -1274,14 +1304,15 @@ function adminView() {
 }
 
 async function refreshRoleLists() {
+  const empty = { admins: new Set(), superadmins: new Set(), accounts: [] };
   if (!remote.signedIn || !cloudAdmin) {
-    roleLists = { admins: new Set(), superadmins: new Set() };
+    roleLists = empty;
     return roleLists;
   }
   try {
     roleLists = await remote.fetchRoles();
   } catch {
-    roleLists = { admins: new Set(), superadmins: new Set() };
+    roleLists = empty;
   }
   return roleLists;
 }

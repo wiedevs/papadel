@@ -212,8 +212,9 @@ export function createRemote({
     }
   }
 
-  // Both lists at once: the admin menu shows every known account, so it needs
-  // to know which are staff and which are super.
+  // Both lists plus the account directory, so the admin menu shows everyone
+  // who has signed in — including accounts with no role yet, which is the
+  // whole point of the directory.
   async function fetchRoles() {
     const read = async (table) => {
       try {
@@ -223,8 +224,18 @@ export function createRemote({
         return new Set();
       }
     };
+    let accounts = [];
+    try {
+      const rows = await authorized(
+        '/rest/v1/accounts?select=email,full_name,avatar_url,provider,first_login_at,last_login_at&order=last_login_at.desc',
+        { method: 'GET' }
+      );
+      accounts = (Array.isArray(rows) ? rows : []).filter((r) => r?.email);
+    } catch {
+      accounts = [];
+    }
     const [admins, superadmins] = await Promise.all([read('admins'), read('superadmins')]);
-    return { admins, superadmins };
+    return { admins, superadmins, accounts };
   }
 
   // Upsert so re-granting an existing address is a no-op rather than a conflict.
