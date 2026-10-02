@@ -252,6 +252,85 @@ test('recover: email kosong ditolak server, bukan oleh klien', async () => {
   assert.equal(calls.length, 1);
 });
 
+// --- ganti kata sandi ------------------------------------------------------
+
+test('updatePassword: memakai token sesi, bukan anon key', async () => {
+  const { calls, remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/auth/v1/user': () => respond(200, { id: 'u1' }),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  await remote.updatePassword('rahasia123');
+  const w = calls[1];
+  assert.equal(w.init.method, 'PUT');
+  assert.equal(w.init.headers.Authorization, 'Bearer AT1');
+  assert.deepEqual(w.body, { password: 'rahasia123' });
+});
+
+test('updatePassword: sandi kosong ditolak tanpa menyentuh jaringan', async () => {
+  let sent = 0;
+  const remote = createRemote({
+    url: 'https://x.supabase.co',
+    anonKey: 'k',
+    fetchImpl: () => { sent += 1; throw new Error('tidak boleh dipanggil'); },
+  });
+  await assert.rejects(() => remote.updatePassword(''), /tidak boleh kosong/);
+  await assert.rejects(() => remote.updatePassword(null), /tidak boleh kosong/);
+  assert.equal(sent, 0);
+});
+
+test('updatePassword: 422 dari GoTrue diteruskan dengan pesannya', async () => {
+  const { remote } = harness({
+    handlers: {
+      '/auth/v1/token': () => respond(200, TOKEN),
+      '/auth/v1/user': () => respond(422, { message: 'New password should be different from the old password.' }),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  await assert.rejects(() => remote.updatePassword('rahasia123'), /different from the old/);
+});
+
+test('verifyPassword: benar → true, dan sesi yang ada tidak terganti', async () => {
+  const { calls, remote } = harness({
+    handlers: { '/auth/v1/token': () => respond(200, { ...TOKEN, access_token: 'AT2' }) },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  const before = remote.storedSession;
+  assert.equal(await remote.verifyPassword('pw'), true);
+  // The re-auth token must not be adopted: it would silently extend or replace
+  // the session the rest of the app is holding.
+  assert.equal(remote.storedSession, before);
+  assert.deepEqual(calls[1].body, { email: 'a@b.c', password: 'pw' });
+});
+
+test('verifyPassword: salah → false, bukan error', async () => {
+  const { remote } = harness({
+    handlers: {
+      // First call signs in, second one is the re-check that must fail.
+      '/auth/v1/token': (call) =>
+        call.init.body && JSON.parse(call.init.body).password === 'salah'
+          ? respond(400, { message: 'Invalid login credentials' })
+          : respond(200, TOKEN),
+    },
+  });
+  await remote.signIn('a@b.c', 'pw');
+  assert.equal(await remote.verifyPassword('salah'), false);
+  assert.equal(remote.signedIn, true, 'percobaan gagal tidak boleh mengeluarkan sesi');
+});
+
+test('verifyPassword: tanpa sesi → false tanpa jaringan', async () => {
+  let sent = 0;
+  const remote = createRemote({
+    url: 'https://x.supabase.co',
+    anonKey: 'k',
+    fetchImpl: () => { sent += 1; throw new Error('tidak boleh dipanggil'); },
+  });
+  assert.equal(await remote.verifyPassword('pw'), false);
+  assert.equal(sent, 0);
+});
+
 test('exchangeAuthCode: menukar code + verifier jadi sesi', async () => {
   const { calls, remote } = harness({
     handlers: {

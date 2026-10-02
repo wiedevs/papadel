@@ -262,6 +262,48 @@ async function cloudRecover(email) {
   return t('toast.recoverSent');
 }
 
+// Returns false when the dialog should stay open with an error. GoTrue's own
+// rules (length, similarity to the email) still apply server-side; the checks
+// here only catch the two mistakes it would answer with a message the admin
+// cannot act on: a mismatched confirmation, and a too-short password.
+async function submitChangePassword() {
+  const current = document.getElementById('f-current-secret')?.value ?? '';
+  const next = document.getElementById('f-new-secret')?.value ?? '';
+  const again = document.getElementById('f-new-secret-2')?.value ?? '';
+
+  if (next !== again) {
+    errorField = 'f-new-secret-2';
+    showUnlockError(t('toast.passwordMismatch'));
+    return false;
+  }
+  if (next.length < 6) {
+    errorField = 'f-new-secret';
+    showUnlockError(t('toast.passwordTooShort'));
+    return false;
+  }
+  if (!(await remote.verifyPassword(current))) {
+    errorField = 'f-current-secret';
+    showUnlockError(t('toast.passwordCurrentWrong'));
+    return false;
+  }
+
+  try {
+    await remote.updatePassword(next);
+  } catch (err) {
+    errorField = 'f-new-secret';
+    // 422 is GoTrue rejecting the secret itself (too weak, too similar to the
+    // email); its `msg` is already written for a human.
+    showUnlockError(
+      err?.status === 422 ? err.message : t('toast.passwordChangeFail')
+    );
+    return false;
+  }
+
+  unlockMode = 'signin';
+  flashMsg(t('toast.passwordChanged'), 'ok');
+  return true;
+}
+
 // Kicked over to /auth/v1/authorize with a PKCE challenge; the browser leaves
 // this page, so anything unsaved is already in localStorage by now.
 async function startGoogleLogin() {
@@ -509,14 +551,19 @@ function roleButton(r) {
 const LOCK_ICON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
 
+const KEY_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="14" height="14"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2m-4 4 3 3m-6 0 3 3"/></svg>';
+
 function renderRoleToggle() {
   if (!$roleToggle) return;
   $roleToggle.setAttribute?.('aria-label', t('role.toggleLabel'));
   if (cloudAvailable) {
     // Signed in: admin is a fact about the token, so the only useful control is
-    // leaving it. Not signed in: the way in is a login, not a role switch.
+    // leaving it — plus changing the password it signs in with. Not signed in:
+    // the way in is a login, not a role switch.
     $roleToggle.innerHTML = remote.signedIn
-      ? `<button class="lang-btn active" data-action="sign-out" title="${t('role.signOutTitle')}">${t('role.signOut')}</button>`
+      ? `<button class="lang-btn" data-action="show-change-password" title="${t('role.changePasswordTitle')}">${KEY_ICON}${t('role.changePassword')}</button>
+        <button class="lang-btn active" data-action="sign-out" title="${t('role.signOutTitle')}">${t('role.signOut')}</button>`
       : `<button class="lang-btn" data-action="show-unlock" title="${t('role.signIn.title')}">${LOCK_ICON}${t('role.signIn')}</button>`;
     return;
   }
@@ -529,6 +576,9 @@ function renderRoleToggle() {
 // the credentials go to Supabase Auth, so the server decides who may write; the
 // passcode survives only as the local-mode affordance it always claimed to be.
 let unlockMode = 'signin';
+// Which change-password field the error message is about, so the red outline
+// lands on the input the admin actually has to fix.
+let errorField = 'f-current-secret';
 
 const GOOGLE_ICON =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 0 0-1.7 19.9v-6.2H8.3a.3.3 0 0 1-.3-.3v-2.5h2V9.4a2.9 2.9 0 0 1 3.2-2.9c.9 0 1.7.1 2.2.3v2.4h-1.2c-.8 0-1.2.5-1.2 1.1v1.8h2.4l-.4 2.5h-2v6.2A10 10 0 0 0 12 2z"/></svg>';
@@ -576,8 +626,37 @@ function recoverFormHtml() {
     </form>`;
 }
 
+// The current password never leaves the browser: it is re-checked against
+// GoTrue's password grant, whose token is discarded. GoTrue itself would replace
+// the password on the bearer token alone, so this is the only thing standing
+// between a borrowed session and a locked-out owner.
+function changePasswordFormHtml() {
+  return `<form class="unlock-body" novalidate>
+      <h2>${t('role.changePasswordTitle')}</h2>
+      <label class="field">${t('role.changePasswordCurrent')}
+        <input id="f-current-secret" type="password" autocomplete="current-password" required>
+      </label>
+      <label class="field">${t('role.changePasswordNew')}
+        <input id="f-new-secret" type="password" autocomplete="new-password" minlength="6" required>
+      </label>
+      <label class="field">${t('role.changePasswordConfirm')}
+        <input id="f-new-secret-2" type="password" autocomplete="new-password" minlength="6" required>
+      </label>
+      <p class="unlock-error" id="unlock-error" hidden></p>
+      <div class="row end">
+        <button class="btn" type="button" data-action="cancel-unlock">${t('role.unlockCancel')}</button>
+        <button class="btn primary" type="submit">${t('role.changePasswordSubmit')}</button>
+      </div>
+      <p class="muted unlock-hint">${t('role.changePasswordHint')}</p>
+    </form>`;
+}
+
 function unlockDialogHtml() {
-  if (cloudAvailable) return unlockMode === 'recover' ? recoverFormHtml() : signinFormHtml();
+  if (cloudAvailable) {
+    if (unlockMode === 'recover') return recoverFormHtml();
+    if (unlockMode === 'change-password') return changePasswordFormHtml();
+    return signinFormHtml();
+  }
   return `<form class="unlock-body" novalidate>
     <h2>${t('role.unlock.title')}</h2>
     <label class="field">${t('role.unlockLabel')}
@@ -602,21 +681,31 @@ function openUnlockDialog(mode = 'signin') {
 
 function dialogFocusId() {
   if (!cloudAvailable) return 'f-passcode';
-  return unlockMode === 'recover' ? 'f-recover-email' : 'f-email';
+  if (unlockMode === 'recover') return 'f-recover-email';
+  if (unlockMode === 'change-password') return 'f-current-secret';
+  return 'f-email';
 }
 
-function showUnlockError(message) {
+// Each mode blames a different field: a bad email belongs to the address box, a
+// wrong old password to the current-password box, a rejected login to the
+// password box. Focusing the right one saves hunting for the red outline.
+function errorFocusId() {
+  if (!cloudAvailable) return 'f-passcode';
+  if (unlockMode === 'recover') return 'f-recover-email';
+  if (unlockMode === 'change-password') return errorField;
+  return 'f-secret';
+}
+
+function showUnlockError(message, focusId = null) {
   const box = document.getElementById('unlock-error');
   if (box) {
     box.textContent = message || t('toast.passcodeWrong');
     box.hidden = false;
   }
-  const input = document.getElementById(
-    !cloudAvailable ? 'f-passcode' : unlockMode === 'recover' ? 'f-recover-email' : 'f-secret'
-  );
+  const input = document.getElementById(focusId || errorFocusId());
   if (input) {
     input.setAttribute('aria-invalid', 'true');
-    input.select();
+    if (input.select) input.select();
     input.focus();
   }
 }
@@ -1420,6 +1509,13 @@ $unlockDialog?.addEventListener('submit', async (e) => {
         flashMsg(message, 'ok');
         return;
       }
+      if (unlockMode === 'change-password') {
+        const ok = await submitChangePassword();
+        if (submit) submit.disabled = false;
+        if (!ok) return;
+        $unlockDialog.close();
+        return;
+      }
       await cloudSignIn(document.getElementById('f-email')?.value ?? '', document.getElementById('f-secret')?.value ?? '');
       $unlockDialog.close();
     } catch (err) {
@@ -1453,6 +1549,10 @@ $unlockDialog?.addEventListener('click', async (e) => {
   }
   if (e.target.closest('[data-action="back-to-signin"]')) {
     openUnlockDialog('signin');
+    return;
+  }
+  if (e.target.closest('[data-action="show-change-password"]')) {
+    openUnlockDialog('change-password');
     return;
   }
   const google = e.target.closest('[data-action="oauth-google"]');

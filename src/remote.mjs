@@ -109,6 +109,40 @@ export function createRemote({
     return adopt(data);
   }
 
+  // Re-checks a password without adopting the session it returns. Changing a
+  // password through GoTrue needs no current password, so without this a
+  // borrowed session (a shared laptop left signed in) could lock the real owner
+  // out. The token is fetched only to learn whether it was accepted, then
+  // dropped on the floor.
+  async function verifyPassword(password) {
+    const email = session?.email;
+    if (!email) return false;
+    try {
+      await request('/auth/v1/token?grant_type=password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { email, password: String(password ?? '') },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Changing a password needs the signed-in session, not the anon key: GoTrue
+  // identifies whose password to replace from the bearer token. Wrong current
+  // password comes back 422 with `errors.password`; the caller surfaces it.
+  async function updatePassword(newPassword) {
+    const body = { password: String(newPassword ?? '') };
+    // A blank secret is rejected by the server, but sending it is pointless.
+    if (!body.password) throw new Error('Kata sandi baru tidak boleh kosong.');
+    return authorized('/auth/v1/user', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+  }
+
   // GoTrue answers 200 whether or not the address has an account, so the UI
   // must not claim a mail was sent to a specific one.
   async function recover(email) {
@@ -176,6 +210,8 @@ export function createRemote({
     signOut,
     refresh,
     recover,
+    verifyPassword,
+    updatePassword,
     exchangeAuthCode,
     adoptTokenPayload,
     isAdmin,

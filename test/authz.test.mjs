@@ -104,6 +104,9 @@ test('every action rendered in the UI is either a mapped write or a declared rea
     'show-recover',
     'back-to-signin',
     'send-recover',
+    // Same again: replacing your own password rewrites no board row, and
+    // GoTrue answers only for whoever the bearer token already names.
+    'show-change-password',
   ]);
   const rendered = new Set([...appSource.matchAll(/data-action="([a-z-]+)"/g)].map((m) => m[1]));
   assert.ok(rendered.size >= 22, `expected the UI action inventory, got ${rendered.size}`);
