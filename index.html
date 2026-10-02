@@ -299,6 +299,19 @@
   .unlock-body h2 { margin: 0; font-size: 16px; }
   .unlock-error { margin: 0; font-size: 13px; color: var(--danger); }
   .unlock-hint { margin: 0; font-size: 12px; line-height: 1.5; }
+  /* Google's sign-in guidelines ask for a white button with a hairline border
+     and their mark at full colour, so it reads as Google's rather than as one
+     of this app's own controls. */
+  .oauth-btn {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; padding: 10px 14px; font-size: 14px; font-weight: 500;
+    color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; cursor: pointer;
+  }
+  .oauth-btn:hover:not(:disabled) { border-color: var(--muted); }
+  .oauth-btn:disabled { opacity: .6; cursor: default; }
+  .g-mark { width: 18px; height: 18px; flex: 0 0 auto; display: block; }
+  .oauth-or { margin: 0; font-size: 12px; text-align: center; }
   footer { max-width: 1060px; margin: 0 auto; padding: 0 20px 30px; }
 </style>
 </head>
