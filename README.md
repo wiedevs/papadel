@@ -2,7 +2,7 @@
 
 Prototipe browser untuk sesi padel mingguan: satu lapangan, 4 pemain per permainan, rotasi merata, dan skor format Americano. Tujuannya **memvalidasi logika domain** (pencocokan, keadilan jumlah permainan, pembobotan pasangan/lawan) sebelum dibangun versi produksi. Bukan MVP, bukan produk jadi.
 
-Live: <https://wiedevs.github.io/papadel/>
+Live: <https://papadel.vercel.app> (mirror GitHub Pages: <https://wiedevs.github.io/papadel/>)
 
 ## Menjalankan lokal
 
@@ -100,7 +100,10 @@ Dua kamus (`id`, `en`) wajib identik kunci demi kunci tanpa duplikat; jumlah dan
 
 ## Deploy
 
-Push ke `main` = deploy. GitHub Pages dibangun dari root repo tanpa build step (<https://wiedevs.github.io/papadel/>).
+Push ke `main` = deploy ke dua target, keduanya dibangun dari root repo tanpa build step:
+
+- **Vercel** (<https://papadel.vercel.app>) — alamat utama.
+- **GitHub Pages** (<https://wiedevs.github.io/papadel/>) — mirror, tetap jalan sebagai cadangan kalau Vercel bermasalah.
 
 ## Langkah berikutnya
 
