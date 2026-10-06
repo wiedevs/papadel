@@ -118,7 +118,7 @@ CREATE TRIGGER set_app_account
 
 ---
 
-## 7. Environment & Local Test
+## 8. Environment & Local Test
 
 | Komponen | Versi |
 |---|---|
@@ -130,7 +130,34 @@ CREATE TRIGGER set_app_account
 
 ---
 
-## 8. Kesimpulan
+## 9. UI Changes (Revis)
+
+| No | Perubahan | Status |
+|---|---|---|
+| 1 | Status login user di kanan atas (email + role + synced) | ✅ |
+| 2 | Brand/logo + "Papadel" → link ke leaderboard | ✅ (ada sejak awal) |
+| 3 | Round tidak dimainkan tidak ditampilkan di detail sesi | ✅ (filter `status === 'played'`) |
+
+**HTML brand (index.html:323):**
+```html
+<div class="brand">
+  <a href="#" data-action="nav" data-view="leaderboard">
+    <img src="assets/logo.png" alt="PaPadel logo" />
+    <span class="wordmark">Pa<span>Padel</span></span>
+  </a>
+</div>
+```
+
+**JS status login (app.mjs:588-596):**
+```js
+<span class="cloud-pill muted login-status">${esc(remote.email)}</span>
+<span class="cloud-pill muted role-badge">${esc(remote.role)}</span>
+<span class="cloud-pill muted">${t('cloud.synced')}</span>
+```
+
+---
+
+## 10. Kesimpulan
 
 Semua komponen **terverifikasi**:
 - Domain utama: `papadel.tanwin.web.id` ✅
