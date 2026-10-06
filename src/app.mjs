@@ -587,6 +587,7 @@ function renderRoleToggle() {
     // the way in is a login, not a role switch.
     $roleToggle.innerHTML = remote.signedIn
       ? `<button class="lang-btn" data-action="show-change-password" title="${t('role.changePasswordTitle')}">${KEY_ICON}${t('role.changePassword')}</button>
+        <span class="cloud-pill muted">${esc(remote.email)}</span>
         <button class="lang-btn active" data-action="sign-out" title="${t('role.signOutTitle')}">${t('role.signOut')}</button>`
       : `<button class="lang-btn" data-action="show-unlock" title="${t('role.signIn.title')}">${LOCK_ICON}${t('role.signIn')}</button>`;
     return;
@@ -1451,6 +1452,7 @@ function sessionDetail(session) {
     .sort((x, y) => y.s.points - x.s.points || y.s.wins - x.s.wins || x.p.name.localeCompare(y.p.name));
 
   const matchRows = session.rounds
+    .filter(r => r.status === 'played')
     .map((r) => {
       if (editingTeamsRoundId === r.id) {
         return `<tr><td colspan="5">${roundTeamsEditor(session, r)}</td></tr>`;
