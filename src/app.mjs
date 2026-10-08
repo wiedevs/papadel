@@ -587,8 +587,6 @@ function renderRoleToggle() {
     // the way in is a login, not a role switch.
     $roleToggle.innerHTML = remote.signedIn
       ? `<button class="lang-btn" data-action="show-change-password" title="${t('role.changePasswordTitle')}">${KEY_ICON}${t('role.changePassword')}</button>
-        <span class="cloud-pill muted email-badge">${esc(remote.email)}</span>
-        <span class="cloud-pill muted role-badge">${esc(remote.role)}</span>
         <button class="lang-btn active" data-action="sign-out" title="${t('role.signOutTitle')}">${t('role.signOut')}</button>`
       : `<button class="lang-btn" data-action="show-unlock" title="${t('role.signIn.title')}">${LOCK_ICON}${t('role.signIn')}</button>`;
     return;
